@@ -1,0 +1,175 @@
+name: VEXOR Ubuntu VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_restart:
+        required: false
+        default: 'true'
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Ubuntu User, SSH & Dependencies
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv curl wget jq >/dev/null
+
+          if ! id "$SSH_USER" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$SSH_USER"
+          fi
+          echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
+          echo "root:$SSH_PASS" | sudo chpasswd
+          echo "$SSH_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/$SSH_USER" >/dev/null
+
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+          sudo mkdir -p /run/sshd
+          sudo systemctl restart ssh || sudo service ssh restart
+          echo "[+] SSH ready for user: $SSH_USER"
+
+      - name: Restore Backup or Extract bot1.zip
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_REPO:  ${{ github.repository }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          USER_HOME="/home/$SSH_USER"
+          BOT_DIR="$USER_HOME/bot"
+          sudo mkdir -p "$BOT_DIR"
+
+          echo "[*] Checking for existing delta backup in GitHub Releases..."
+          if gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
+            echo "[+] Restoring previous session files..."
+            sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME"
+            rm -f "/tmp/ubuntu_delta.tar.gz"
+          elif [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
+            echo "[+] First run: Extracting bot1.zip to $BOT_DIR ..."
+            sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
+          fi
+
+          sudo chown -R "$SSH_USER:$SSH_USER" "$USER_HOME"
+          echo "[+] Files ready in $BOT_DIR"
+
+      - name: Install bore & Start SSH Tunnel
+        id: tunnel
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHATS: ${{ secrets.TG_CHATS }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
+        run: |
+          curl -Ls "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz" -o /tmp/bore.tar.gz
+          sudo tar -xzf /tmp/bore.tar.gz -C /usr/local/bin bore
+          sudo chmod +x /usr/local/bin/bore
+
+          nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+          BORE_PID=$!
+
+          BORE_HOST=""
+          for i in $(seq 1 20); do
+            sleep 2
+            if grep -q "listening at bore.pub:" /tmp/bore.log 2>/dev/null; then
+              BORE_HOST=$(grep -oE "bore\.pub:[0-9]+" /tmp/bore.log | head -1)
+              break
+            fi
+          done
+
+          [ -z "$BORE_HOST" ] && { echo "[!] Failed to start bore"; cat /tmp/bore.log; exit 1; }
+          BORE_PORT="${BORE_HOST#*:}"
+
+          echo "[+] SSH Tunnel Ready: $BORE_HOST"
+          MSG="VEXOR+Ubuntu+VPS+Ready%0A%F0%9F%96%A5+Host%3A+$BORE_HOST%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%93%82+Bot+Dir%3A+~%2Fbot%0A%F0%9F%92%BB+Termux%3A+ssh+$SSH_USER%40bore.pub+-p+$BORE_PORT"
+
+          IFS=',' read -ra CHATS <<< "$TG_CHATS"
+          for CHAT_ID in "${CHATS[@]}"; do
+            CHAT_ID=$(echo "$CHAT_ID" | xargs)
+            [ -n "$CHAT_ID" ] && curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${MSG}" >/dev/null || true
+          done
+
+          echo "bore_pid=$BORE_PID" >> $GITHUB_OUTPUT
+          echo "BORE_HOST=$BORE_HOST" >> $GITHUB_ENV
+
+      - name: Watchdog + Auto-Save + Auto-Restart
+        env:
+          GH_TOKEN:     ${{ secrets.GH_PAT }}
+          GH_REPO:      ${{ github.repository }}
+          GH_REF:       ${{ github.ref_name }}
+          TG_TOKEN:     ${{ secrets.TG_TOKEN }}
+          TG_CHATS:     ${{ secrets.TG_CHATS }}
+          SSH_USER:     ${{ secrets.SSH_USER }}
+          SSH_PASS:     ${{ secrets.SSH_PASS }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          BORE_PID:     ${{ steps.tunnel.outputs.bore_pid }}
+        run: |
+          START_TS=$(date +%s)
+          LAST_TS=$START_TS
+          CUR_PID="$BORE_PID"
+
+          save_backup() {
+            echo "[*] Saving /home/$SSH_USER backup to GitHub Releases..."
+            sudo tar --exclude='.cache' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/home/$SSH_USER" . 2>/dev/null || true
+            if [ -f /tmp/ubuntu_delta.tar.gz ]; then
+              gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
+                gh release create "delta-backup" --title "Delta Backup" --notes "Automated state backup" --repo "$GH_REPO" >/dev/null 2>&1 || true
+              gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz#ubuntu_delta.tar.gz" --clobber --repo "$GH_REPO" >/dev/null 2>&1 && \
+                echo "[+] Backup uploaded OK" || echo "[!] Backup upload warning"
+              rm -f /tmp/ubuntu_delta.tar.gz
+            fi
+          }
+
+          while true; do
+            NOW_TS=$(date +%s)
+            ELAPSED_MIN=$(( (NOW_TS - START_TS) / 60 ))
+            SINCE_SAVE=$(( (NOW_TS - LAST_TS) / 60 ))
+
+            if ! kill -0 "$CUR_PID" 2>/dev/null; then
+              echo "[!] bore disconnected, restarting..."
+              rm -f /tmp/bore.log
+              nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+              CUR_PID=$!
+              sleep 5
+              NEW_HOST=$(grep -oE "bore\.pub:[0-9]+" /tmp/bore.log | head -1 || true)
+              if [ -n "$NEW_HOST" ]; then
+                NEW_PORT="${NEW_HOST#*:}"
+                MSG="VEXOR+Ubuntu+Reconnected%0A%F0%9F%96%A5+Host%3A+$NEW_HOST%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%92%BB+ssh+$SSH_USER%40bore.pub+-p+$NEW_PORT"
+                IFS=',' read -ra CHATS <<< "$TG_CHATS"
+                for CHAT_ID in "${CHATS[@]}"; do
+                  CHAT_ID=$(echo "$CHAT_ID" | xargs)
+                  [ -n "$CHAT_ID" ] && curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${MSG}" >/dev/null || true
+                done
+              fi
+            fi
+
+            if [ "$SINCE_SAVE" -ge 45 ] && [ "$ELAPSED_MIN" -lt 340 ]; then
+              save_backup
+              LAST_TS=$(date +%s)
+            fi
+
+            if [ "$ELAPSED_MIN" -ge 348 ] && [ "$AUTO_RESTART" = "true" ]; then
+              save_backup
+              curl -s -X POST \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/dispatches" \
+                -d "{\"ref\":\"$GH_REF\",\"inputs\":{\"auto_restart\":\"true\"}}" >/dev/null 2>&1 || true
+              echo "[+] Next Ubuntu session triggered!"
+              break
+            fi
+
+            echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST}"
+            sleep 60
+          done
