@@ -19,7 +19,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Full VPS Environment, SSH & Helper Tools
+      - name: Setup Full Root VPS Environment & Helper Tools
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
@@ -30,30 +30,31 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv python3-full curl wget jq netcat-openbsd openssl git build-essential cron htop lsof >/dev/null
 
+          # تسجيل قائمة الحزم والخدمات الافتراضية لاكتشاف أي حزمة أو خدمة يثبتها المستخدم لاحقاً بشكل تلقائي
+          apt-mark showmanual | sort > /etc/vps_base_pkgs.txt
+          ls -1 /etc/systemd/system > /etc/vps_base_systemd.txt
+
           echo "PIP_BREAK_SYSTEM_PACKAGES=1" | sudo tee -a /etc/environment >/dev/null
           sudo pip3 install --break-system-packages -q requests urllib3 PySocks cryptography asn1crypto
 
-          if ! id "$SSH_USER" >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash "$SSH_USER"
-          fi
-          echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
           echo "root:$SSH_PASS" | sudo chpasswd
-          echo "$SSH_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/$SSH_USER" >/dev/null
+          if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
+            if ! id "$SSH_USER" >/dev/null 2>&1; then
+              sudo useradd -M -d /root -o -u 0 -g 0 -s /bin/bash "$SSH_USER" 2>/dev/null || true
+            fi
+            echo "$SSH_USER:$SSH_PASS" | sudo chpasswd 2>/dev/null || true
+          fi
 
           curl -Ls "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz" -o /tmp/bore.tar.gz
           sudo tar -xzf /tmp/bore.tar.gz -C /usr/local/bin bore
           sudo chmod +x /usr/local/bin/bore
           sudo rm -f /tmp/bore.tar.gz
 
-          # إنشاء أوامر التحكم بالـ VPS
           cat << 'EOF' | sudo tee /usr/local/bin/vps-apt >/dev/null
           #!/bin/bash
-          if [ $# -eq 0 ]; then
-            echo "Usage: vps-apt <package1> [package2 ...]"
-            exit 1
-          fi
-          sudo apt-get update -qq && sudo apt-get install -y "$@"
-          SYS_DIR="$HOME/.vps_system"
+          [ $# -eq 0 ] && { echo "Usage: vps-apt <package1> [package2 ...]"; exit 1; }
+          apt-get update -qq && apt-get install -y "$@"
+          SYS_DIR="/root/.vps_system"
           mkdir -p "$SYS_DIR"
           for pkg in "$@"; do
             grep -qxF "$pkg" "$SYS_DIR/apt_packages.txt" 2>/dev/null || echo "$pkg" >> "$SYS_DIR/apt_packages.txt"
@@ -65,31 +66,28 @@ jobs:
           #!/bin/bash
           if [ $# -lt 2 ]; then
             echo "Usage: add-bot <name> \"<command>\""
-            echo "Example: add-bot mybot \"cd ~/mybot && python3 main.py\""
+            echo "Example: add-bot myservice \"cd /root/myservice && python3 app.py\""
             exit 1
           fi
           NAME="$1"
           shift
           CMD="$*"
-          SYS_DIR="$HOME/.vps_system"
+          SYS_DIR="/root/.vps_system"
           mkdir -p "$SYS_DIR"
           sed -i "/^${NAME}|/d" "$SYS_DIR/services.conf" 2>/dev/null || true
           echo "${NAME}|${CMD}" >> "$SYS_DIR/services.conf"
           tmux kill-session -t "svc_${NAME}" 2>/dev/null || true
-          tmux new-session -d -s "svc_${NAME}" "while true; do eval '$CMD'; echo 'Restarting in 5s...'; sleep 5; done"
-          echo "[+] Service '$NAME' started in tmux session 'svc_${NAME}' and saved for auto-start!"
+          tmux new-session -d -s "svc_${NAME}" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; while true; do eval '$CMD'; echo 'Restarting in 5s...'; sleep 5; done"
+          echo "[+] Service '$NAME' started in root tmux session 'svc_${NAME}' and saved permanently!"
           EOF
 
           cat << 'EOF' | sudo tee /usr/local/bin/open-port >/dev/null
           #!/bin/bash
-          if [ $# -lt 1 ]; then
-            echo "Usage: open-port <local_port> [remote_port]"
-            exit 1
-          fi
+          [ $# -lt 1 ] && { echo "Usage: open-port <local_port> [remote_port]"; exit 1; }
           LPORT="$1"
           RPORT="${2:-0}"
           RELAY="159.223.110.159"
-          SYS_DIR="$HOME/.vps_system"
+          SYS_DIR="/root/.vps_system"
           mkdir -p "$SYS_DIR"
           sed -i "/^${LPORT}|/d" "$SYS_DIR/ports.conf" 2>/dev/null || true
           echo "${LPORT}|${RPORT}" >> "$SYS_DIR/ports.conf"
@@ -108,14 +106,15 @@ jobs:
           #!/bin/bash
           LPORT="$1"
           [ -z "$LPORT" ] && { echo "Usage: close-port <local_port>"; exit 1; }
-          sed -i "/^${LPORT}|/d" "$HOME/.vps_system/ports.conf" 2>/dev/null || true
+          sed -i "/^${LPORT}|/d" "/root/.vps_system/ports.conf" 2>/dev/null || true
           pkill -f "bore local ${LPORT} " 2>/dev/null || true
           echo "[+] Closed and removed port $LPORT"
           EOF
 
           cat << 'EOF' | sudo tee /usr/local/bin/vps-status >/dev/null
           #!/bin/bash
-          echo "=== VEXOR FULL VPS STATUS ==="
+          echo "=== VEXOR ROOT FULL VPS STATUS ==="
+          echo "[*] User:   $(whoami) (Home: $HOME)"
           echo "[*] Uptime: $(uptime -p)"
           echo "[*] Memory: $(free -h | awk '/^Mem:/ {print $3 " / " $2}')"
           echo "[*] Disk:   $(df -h / | awk 'NR==2 {print $3 " / " $2}')"
@@ -129,7 +128,7 @@ jobs:
 
           sudo chmod +x /usr/local/bin/vps-apt /usr/local/bin/add-bot /usr/local/bin/open-port /usr/local/bin/close-port /usr/local/bin/vps-status
 
-      - name: Restore Encrypted Backup, SSH Identity, Packages & Services
+      - name: Restore Root Backup, SSH Identity, Packages & Services
         env:
           RUNNER_TRACKING_ID: ""
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -137,26 +136,32 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
-          USER_HOME="/home/$SSH_USER"
-          BOT_DIR="$USER_HOME/bot"
-          SYS_DIR="$USER_HOME/.vps_system"
-          sudo mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$USER_HOME/autostart"
+          USER_HOME="/root"
+          BOT_DIR="/root/bot"
+          SYS_DIR="/root/.vps_system"
+          sudo mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/systemd_services" "/root/autostart"
+
+          # ربط /home/$SSH_USER بـ /root لضمان عمل أي مسار قديم بدون مشاكل
+          if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
+            sudo rm -rf "/home/$SSH_USER"
+            sudo ln -s /root "/home/$SSH_USER"
+          fi
 
           if gh release download "delta-backup" -p "ubuntu_delta.tar.gz.enc" -O "/tmp/ubuntu_delta.tar.gz.enc" --repo "$GH_REPO" 2>/dev/null; then
-            echo "[+] Restoring encrypted backup..."
+            echo "[+] Restoring encrypted backup into /root..."
             openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in "/tmp/ubuntu_delta.tar.gz.enc" -out "/tmp/ubuntu_delta.tar.gz"
-            sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME" 2>/dev/null || true
+            sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
             sudo rm -f "/tmp/ubuntu_delta.tar.gz" "/tmp/ubuntu_delta.tar.gz.enc"
           elif gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
-            echo "[+] Restoring previous unencrypted backup..."
-            sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME" 2>/dev/null || true
+            echo "[+] Restoring previous unencrypted backup into /root..."
+            sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
             sudo rm -f "/tmp/ubuntu_delta.tar.gz"
           elif [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
             echo "[+] First run: Extracting bot1.zip..."
             sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
           fi
 
-          # استعادة أو حفظ بصمة مفاتيح السيرفر (SSH Host Keys) لمنع خطأ تغير الهوية في Termux
+          # استعادة بصمة مفاتيح SSH الثابتة
           if ls "$SYS_DIR/ssh_keys/ssh_host_"* >/dev/null 2>&1; then
             sudo cp -f "$SYS_DIR/ssh_keys/ssh_host_"* /etc/ssh/
             sudo chmod 600 /etc/ssh/ssh_host_*_key
@@ -175,44 +180,55 @@ jobs:
           sudo mkdir -p /run/sshd
           sudo systemctl restart ssh || sudo service ssh restart
 
-          # إعداد حفظ مكتبات بايثون تلقائياً داخل مجلد المستخدم
-          grep -q "PIP_USER=1" "$USER_HOME/.bashrc" 2>/dev/null || cat << 'BEOF' | sudo tee -a "$USER_HOME/.bashrc" >/dev/null
+          # حفظ مكتبات بايثون تلقائياً داخل /root/.local
+          grep -q "PYTHONUSERBASE=" /root/.bashrc 2>/dev/null || cat << 'BEOF' | sudo tee -a /root/.bashrc >/dev/null
           export PIP_USER=1
           export PIP_BREAK_SYSTEM_PACKAGES=1
-          export PYTHONUSERBASE="$HOME/.local"
-          export PATH="$HOME/.local/bin:$PATH"
+          export PYTHONUSERBASE="/root/.local"
+          export PATH="/root/.local/bin:$PATH"
           BEOF
 
-          # إعادة تثبيت حزم النظام المحفوظة بـ vps-apt
+          # إعادة تثبيت كل الحزم التي ثبتها المستخدم بـ apt install أو vps-apt
           if [ -s "$SYS_DIR/apt_packages.txt" ]; then
             echo "[+] Reinstalling persistent apt packages..."
             xargs -a "$SYS_DIR/apt_packages.txt" sudo apt-get install -y -qq >/dev/null 2>&1 || true
           fi
 
-          # استعادة مهام Crontab إن وجدت
-          if [ -s "$SYS_DIR/user.cron" ]; then
-            sudo -u "$SSH_USER" crontab "$SYS_DIR/user.cron" 2>/dev/null || true
+          # استعادة وتشغيل أي خدمات systemd أنشأها المستخدم
+          if ls "$SYS_DIR/systemd_services/"*.service >/dev/null 2>&1; then
+            echo "[+] Restoring custom systemd services..."
+            sudo cp -f "$SYS_DIR/systemd_services/"*.service /etc/systemd/system/
+            sudo systemctl daemon-reload
+            for svc in "$SYS_DIR/systemd_services/"*.service; do
+              svc_name=$(basename "$svc")
+              sudo systemctl enable --now "$svc_name" 2>/dev/null || true
+            done
           fi
 
-          # تثبيت متطلبات أي بوت موجود
-          find "$USER_HOME" -maxdepth 3 -name "requirements.txt" 2>/dev/null | while read -r req; do
-            sudo -u "$SSH_USER" PIP_USER=1 PYTHONUSERBASE="$USER_HOME/.local" pip3 install --break-system-packages -q -r "$req" 2>/dev/null || true
+          # استعادة مهام Crontab لـ root
+          if [ -s "$SYS_DIR/user.cron" ]; then
+            sudo crontab "$SYS_DIR/user.cron" 2>/dev/null || true
+          fi
+
+          # تثبيت متطلبات أي بوت موجود داخل /root
+          find /root -maxdepth 3 -name "requirements.txt" 2>/dev/null | while read -r req; do
+            sudo PIP_USER=1 PYTHONUSERBASE="/root/.local" pip3 install --break-system-packages -q -r "$req" 2>/dev/null || true
           done
 
-          cat << 'BOTEOF' | sudo tee "$USER_HOME/run_bot.sh" >/dev/null
+          cat << 'BOTEOF' | sudo tee /root/run_bot.sh >/dev/null
           #!/bin/bash
           export PIP_BREAK_SYSTEM_PACKAGES=1
-          export PYTHONUSERBASE="$HOME/.local"
-          export PATH="$HOME/.local/bin:$PATH"
-          BOT_FILE=$(find "$HOME/bot" -maxdepth 3 -name "bot.py" | head -1)
+          export PYTHONUSERBASE="/root/.local"
+          export PATH="/root/.local/bin:$PATH"
+          BOT_FILE=$(find /root/bot -maxdepth 3 -name "bot.py" | head -1)
           if [ -z "$BOT_FILE" ]; then
-            echo "[!] bot.py not found in ~/bot"
+            echo "[!] bot.py not found in /root/bot"
             sleep 3600
             exit 0
           fi
           cd "$(dirname "$BOT_FILE")"
           while true; do
-            echo "🤖 [$(date '+%H:%M:%S')] Starting VEXOR Bot..."
+            echo "🤖 [$(date '+%H:%M:%S')] Starting VEXOR Bot as root..."
             if [ -f .env ]; then
               set -a
               source .env
@@ -224,27 +240,24 @@ jobs:
           done
           BOTEOF
 
-          sudo chmod +x "$USER_HOME/run_bot.sh"
-          sudo chown -R "$SSH_USER:$SSH_USER" "$USER_HOME"
+          sudo chmod +x /root/run_bot.sh
+          sudo tmux new-session -d -s bot "bash /root/run_bot.sh"
+          echo "[+] Main VEXOR Bot started in root tmux session 'bot'"
 
-          sudo -u "$SSH_USER" tmux new-session -d -s bot "bash $USER_HOME/run_bot.sh"
-          echo "[+] Main VEXOR Bot started in tmux session 'bot'"
-
-      - name: Static IP & Unified Port Tunnel + Full VPS Watchdog
+      - name: Static IP & Unified Port Tunnel + Full Root Watchdog
         env:
           RUNNER_TRACKING_ID: ""
           GH_TOKEN:     ${{ secrets.GH_PAT }}
           GH_REPO:      ${{ github.repository }}
           TG_TOKEN:     ${{ secrets.TG_TOKEN }}
           TG_CHATS:     ${{ secrets.TG_CHATS }}
-          SSH_USER:     ${{ secrets.SSH_USER }}
           SSH_PASS:     ${{ secrets.SSH_PASS }}
           RELAY_IP:     "159.223.110.159"
           FIXED_PORT:   "54822"
         run: |
           set +e
-          USER_HOME="/home/$SSH_USER"
-          SYS_DIR="$USER_HOME/.vps_system"
+          USER_HOME="/root"
+          SYS_DIR="/root/.vps_system"
 
           send_tg() {
             local TEXT="$1"
@@ -293,37 +306,33 @@ jobs:
 
             if [ -n "$BORE_PORT" ]; then
               BORE_HOST="${RELAY_IP}:${BORE_PORT}"
-              MSG="VEXOR+Full+VPS+Ready+%28100%25+Active%29%0A%F0%9F%96%A5+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%A4%96+Bot+Logs%3A+tmux+attach+-t+bot%0A%F0%9F%9B%A0+Status%3A+vps-status%0A%F0%9F%92%BB+Termux%3A+ssh+$SSH_USER%40$RELAY_IP+-p+$BORE_PORT"
+              MSG="VEXOR+ROOT+VPS+Ready+%28100%25+Full+Root%29%0A%F0%9F%96%A5+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+root%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%A4%96+Bot+Logs%3A+tmux+attach+-t+bot%0A%F0%9F%9B%A0+Status%3A+vps-status%0A%F0%9F%92%BB+Termux%3A+ssh+root%40$RELAY_IP+-p+$BORE_PORT"
               send_tg "$MSG"
             fi
           }
 
           check_extra_services_and_ports() {
-            # 1. التأكد من البوت الأساسي
-            if ! sudo -u "$SSH_USER" tmux has-session -t bot 2>/dev/null; then
-              sudo -u "$SSH_USER" tmux new-session -d -s bot "bash $USER_HOME/run_bot.sh"
+            if ! sudo tmux has-session -t bot 2>/dev/null; then
+              sudo tmux new-session -d -s bot "bash /root/run_bot.sh"
             fi
 
-            # 2. التأكد من البوتات والخدمات المضافة بـ add-bot
             if [ -s "$SYS_DIR/services.conf" ]; then
               while IFS='|' read -r sname scmd; do
                 [ -z "$sname" ] && continue
-                if ! sudo -u "$SSH_USER" tmux has-session -t "svc_${sname}" 2>/dev/null; then
-                  sudo -u "$SSH_USER" tmux new-session -d -s "svc_${sname}" "export PATH=\"\$HOME/.local/bin:\$PATH\" PYTHONUSERBASE=\"\$HOME/.local\"; while true; do eval '$scmd'; sleep 5; done"
+                if ! sudo tmux has-session -t "svc_${sname}" 2>/dev/null; then
+                  sudo tmux new-session -d -s "svc_${sname}" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; while true; do eval '$scmd'; sleep 5; done"
                 fi
               done < "$SYS_DIR/services.conf"
             fi
 
-            # 3. التأكد من أي سكربت داخل ~/autostart/*.sh
-            for shfile in "$USER_HOME"/autostart/*.sh; do
+            for shfile in /root/autostart/*.sh; do
               [ -f "$shfile" ] || continue
               bname=$(basename "$shfile" .sh)
-              if ! sudo -u "$SSH_USER" tmux has-session -t "auto_${bname}" 2>/dev/null; then
-                sudo -u "$SSH_USER" tmux new-session -d -s "auto_${bname}" "bash '$shfile'"
+              if ! sudo tmux has-session -t "auto_${bname}" 2>/dev/null; then
+                sudo tmux new-session -d -s "auto_${bname}" "bash '$shfile'"
               fi
             done
 
-            # 4. التأكد من البورتات الإضافية المفتوحة بـ open-port
             if [ -s "$SYS_DIR/ports.conf" ]; then
               while IFS='|' read -r lport rport; do
                 [ -z "$lport" ] && continue
@@ -338,20 +347,37 @@ jobs:
             fi
           }
 
-          save_backup() {
-            echo "[*] Saving encrypted /home/$SSH_USER backup to GitHub Releases..."
-            sudo -u "$SSH_USER" crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
+          capture_system_state() {
+            sudo mkdir -p "$SYS_DIR/ssh_keys" "$SYS_DIR/systemd_services"
+            sudo crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
             sudo cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
-            sudo chown -R "$SSH_USER:$SSH_USER" "$SYS_DIR"
+
+            # التقاط أي حزمة ثبتها المستخدم بـ apt install تلقائياً
+            if [ -f /etc/vps_base_pkgs.txt ]; then
+              comm -13 /etc/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
+              [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
+            fi
+
+            # التقاط أي خدمة systemd جديدة أنشأها المستخدم في /etc/systemd/system
+            if [ -f /etc/vps_base_systemd.txt ]; then
+              comm -13 /etc/vps_base_systemd.txt <(ls -1 /etc/systemd/system | sort) | grep '\.service$' | while read -r new_svc; do
+                [ -f "/etc/systemd/system/$new_svc" ] && sudo cp -f "/etc/systemd/system/$new_svc" "$SYS_DIR/systemd_services/" 2>/dev/null || true
+              done
+            fi
+          }
+
+          save_backup() {
+            echo "[*] Saving encrypted /root backup to GitHub Releases..."
+            capture_system_state
             sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
             sudo tar --warning=no-file-changed --ignore-failed-read \
               --exclude='.cache' --exclude='.npm' --exclude='__pycache__' --exclude='*.log' \
-              -czf /tmp/ubuntu_delta.tar.gz -C "$USER_HOME" . 2>/dev/null
+              -czf /tmp/ubuntu_delta.tar.gz -C "/root" . 2>/dev/null
             if [ -s /tmp/ubuntu_delta.tar.gz ]; then
               sudo chmod 644 /tmp/ubuntu_delta.tar.gz
               openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /tmp/ubuntu_delta.tar.gz -out /tmp/ubuntu_delta.tar.gz.enc
               gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
-                gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
+                gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated root state backup" --repo "$GH_REPO" >/dev/null 2>&1
               gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1 && \
                 echo "[+] Encrypted backup uploaded OK" || echo "[!] Backup upload warning"
               gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
@@ -359,18 +385,21 @@ jobs:
             fi
           }
 
-          # توفير أمر vps-backup للحفظ اليدوي الفوري من داخل السيرفر
           cat << BKEOF | sudo tee /usr/local/bin/vps-backup >/dev/null
           #!/bin/bash
           export GH_TOKEN="$GH_TOKEN"
           export SSH_PASS="$SSH_PASS"
-          sudo -u "$SSH_USER" crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
-          sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
-          sudo tar --warning=no-file-changed --ignore-failed-read --exclude='.cache' --exclude='.npm' --exclude='__pycache__' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "$USER_HOME" . 2>/dev/null
+          crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
+          if [ -f /etc/vps_base_pkgs.txt ]; then
+            comm -13 /etc/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
+            [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
+          fi
+          rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
+          tar --warning=no-file-changed --ignore-failed-read --exclude='.cache' --exclude='.npm' --exclude='__pycache__' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/root" . 2>/dev/null
           openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /tmp/ubuntu_delta.tar.gz -out /tmp/ubuntu_delta.tar.gz.enc
           gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO"
-          sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
-          echo "[+] Manual Encrypted Backup Uploaded Successfully!"
+          rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
+          echo "[+] Manual Encrypted Root Backup Uploaded Successfully!"
           BKEOF
           sudo chmod +x /usr/local/bin/vps-backup
 
@@ -386,7 +415,6 @@ jobs:
 
             check_extra_services_and_ports
 
-            # فحص اتصال النفق أو استرجاع البورت الثابت 54822 إذا كان على بورت احتياطي
             if [ -z "$BORE_PORT" ] || ! kill -0 "$CUR_PID" 2>/dev/null || ! nc -z -w 5 "$RELAY_IP" "$BORE_PORT" 2>/dev/null; then
               echo "[!] Tunnel unresponsive, reconnecting..."
               kill -9 "$CUR_PID" 2>/dev/null || true
@@ -408,38 +436,47 @@ jobs:
 
             if [ "$ELAPSED_MIN" -ge 348 ]; then
               echo "[*] Preparing clean handover to next session..."
-              sudo -u "$SSH_USER" tmux kill-server 2>/dev/null || true
+              sudo tmux kill-server 2>/dev/null || true
               sudo killall -9 bore 2>/dev/null || true
               break
             fi
 
-            echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST} | services=active"
+            echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST} | root_vps=active"
             sleep 60
           done
 
-      - name: Final Encrypted Backup (Always Runs)
+      - name: Final Encrypted Root Backup (Always Runs)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_REPO:  ${{ github.repository }}
-          SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
-          USER_HOME="/home/$SSH_USER"
-          SYS_DIR="$USER_HOME/.vps_system"
-          sudo -u "$SSH_USER" crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
-          sudo -u "$SSH_USER" tmux kill-server 2>/dev/null || true
+          SYS_DIR="/root/.vps_system"
+          sudo mkdir -p "$SYS_DIR/ssh_keys" "$SYS_DIR/systemd_services"
+          sudo crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
+          sudo cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
+          if [ -f /etc/vps_base_pkgs.txt ]; then
+            comm -13 /etc/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
+            [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
+          fi
+          if [ -f /etc/vps_base_systemd.txt ]; then
+            comm -13 /etc/vps_base_systemd.txt <(ls -1 /etc/systemd/system | sort) | grep '\.service$' | while read -r new_svc; do
+              [ -f "/etc/systemd/system/$new_svc" ] && sudo cp -f "/etc/systemd/system/$new_svc" "$SYS_DIR/systemd_services/" 2>/dev/null || true
+            done
+          fi
+          sudo tmux kill-server 2>/dev/null || true
           sudo killall -9 bore 2>/dev/null || true
           sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
           sudo tar --warning=no-file-changed --ignore-failed-read \
             --exclude='.cache' --exclude='.npm' --exclude='__pycache__' --exclude='*.log' \
-            -czf /tmp/ubuntu_delta.tar.gz -C "$USER_HOME" . 2>/dev/null
+            -czf /tmp/ubuntu_delta.tar.gz -C "/root" . 2>/dev/null
           if [ -s /tmp/ubuntu_delta.tar.gz ]; then
             sudo chmod 644 /tmp/ubuntu_delta.tar.gz
             openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /tmp/ubuntu_delta.tar.gz -out /tmp/ubuntu_delta.tar.gz.enc
             gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
-              gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
+              gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated root state backup" --repo "$GH_REPO" >/dev/null 2>&1
             gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
             gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
             sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
