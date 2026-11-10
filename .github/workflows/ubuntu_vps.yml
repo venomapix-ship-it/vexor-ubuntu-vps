@@ -39,7 +39,6 @@ jobs:
           sudo sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
           sudo mkdir -p /run/sshd
           sudo systemctl restart ssh || sudo service ssh restart
-          echo "[+] SSH ready for user: $SSH_USER"
 
       - name: Restore Backup or Extract bot1.zip
         env:
@@ -51,60 +50,15 @@ jobs:
           BOT_DIR="$USER_HOME/bot"
           sudo mkdir -p "$BOT_DIR"
 
-          echo "[*] Checking for existing delta backup in GitHub Releases..."
           if gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
-            echo "[+] Restoring previous session files..."
             sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME"
             sudo rm -f "/tmp/ubuntu_delta.tar.gz"
           elif [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
-            echo "[+] First run: Extracting bot1.zip to $BOT_DIR ..."
             sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
           fi
-
           sudo chown -R "$SSH_USER:$SSH_USER" "$USER_HOME"
-          echo "[+] Files ready in $BOT_DIR"
 
-      - name: Install bore & Start SSH Tunnel
-        id: tunnel
-        env:
-          RUNNER_TRACKING_ID: ""
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHATS: ${{ secrets.TG_CHATS }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PASS: ${{ secrets.SSH_PASS }}
-        run: |
-          curl -Ls "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz" -o /tmp/bore.tar.gz
-          sudo tar -xzf /tmp/bore.tar.gz -C /usr/local/bin bore
-          sudo chmod +x /usr/local/bin/bore
-
-          nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
-          BORE_PID=$!
-
-          BORE_HOST=""
-          for i in $(seq 1 20); do
-            sleep 2
-            if grep -q "listening at bore.pub:" /tmp/bore.log 2>/dev/null; then
-              BORE_HOST=$(grep -oE "bore\.pub:[0-9]+" /tmp/bore.log | head -1)
-              break
-            fi
-          done
-
-          [ -z "$BORE_HOST" ] && { echo "[!] Failed to start bore"; cat /tmp/bore.log; exit 1; }
-          BORE_PORT="${BORE_HOST#*:}"
-
-          echo "[+] SSH Tunnel Ready: $BORE_HOST"
-          MSG="VEXOR+Ubuntu+VPS+Ready%0A%F0%9F%96%A5+Host%3A+$BORE_HOST%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%93%82+Bot+Dir%3A+~%2Fbot%0A%F0%9F%92%BB+Termux%3A+ssh+$SSH_USER%40bore.pub+-p+$BORE_PORT"
-
-          IFS=',' read -ra CHATS <<< "$TG_CHATS"
-          for CHAT_ID in "${CHATS[@]}"; do
-            CHAT_ID=$(echo "$CHAT_ID" | xargs)
-            [ -n "$CHAT_ID" ] && curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${MSG}" >/dev/null || true
-          done
-
-          echo "bore_pid=$BORE_PID" >> $GITHUB_OUTPUT
-          echo "BORE_HOST=$BORE_HOST" >> $GITHUB_ENV
-
-      - name: Watchdog + Auto-Save (Every 45m)
+      - name: Static IP & Unified Port Tunnel + Watchdog (45m Backup)
         env:
           RUNNER_TRACKING_ID: ""
           GH_TOKEN:     ${{ secrets.GH_PAT }}
@@ -113,12 +67,56 @@ jobs:
           TG_CHATS:     ${{ secrets.TG_CHATS }}
           SSH_USER:     ${{ secrets.SSH_USER }}
           SSH_PASS:     ${{ secrets.SSH_PASS }}
-          BORE_PID:     ${{ steps.tunnel.outputs.bore_pid }}
+          RELAY_IP:     "159.223.110.159"
+          FIXED_PORT:   "54822"
         run: |
           set +e
-          START_TS=$(date +%s)
-          LAST_TS=$START_TS
-          CUR_PID="$BORE_PID"
+          curl -Ls "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz" -o /tmp/bore.tar.gz
+          sudo tar -xzf /tmp/bore.tar.gz -C /usr/local/bin bore
+          sudo chmod +x /usr/local/bin/bore
+
+          start_tunnel() {
+            BORE_PORT=""
+            # محاولة حجز البورت الموحد 54822 ثلاث مرات
+            for attempt in 1 2 3; do
+              sudo rm -f /tmp/bore.log
+              nohup bore local 22 --to "$RELAY_IP" --port "$FIXED_PORT" > /tmp/bore.log 2>&1 &
+              CUR_PID=$!
+              for i in $(seq 1 8); do
+                sleep 2
+                if grep -q "listening at" /tmp/bore.log 2>/dev/null; then
+                  BORE_PORT="$FIXED_PORT"
+                  break 2
+                fi
+              done
+              kill -9 "$CUR_PID" 2>/dev/null || true
+              sleep 5
+            done
+
+            # في حال كان البورت 54822 مشغولاً، يفتح بورت احتياطي حتى لا يتوقف السيرفر
+            if [ -z "$BORE_PORT" ]; then
+              sudo rm -f /tmp/bore.log
+              nohup bore local 22 --to "$RELAY_IP" > /tmp/bore.log 2>&1 &
+              CUR_PID=$!
+              for i in $(seq 1 15); do
+                sleep 2
+                if grep -q "listening at" /tmp/bore.log 2>/dev/null; then
+                  BORE_PORT=$(grep -oE ":[0-9]+" /tmp/bore.log | head -1 | tr -d ':')
+                  break
+                fi
+              done
+            fi
+
+            if [ -n "$BORE_PORT" ]; then
+              BORE_HOST="${RELAY_IP}:${BORE_PORT}"
+              MSG="VEXOR+Ubuntu+VPS+Ready%0A%F0%9F%96%A5+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%92%BB+Termux%3A+ssh+$SSH_USER%40$RELAY_IP+-p+$BORE_PORT"
+              IFS=',' read -ra CHATS <<< "$TG_CHATS"
+              for CHAT_ID in "${CHATS[@]}"; do
+                CHAT_ID=$(echo "$CHAT_ID" | xargs)
+                [ -n "$CHAT_ID" ] && curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${MSG}" >/dev/null
+              done
+            fi
+          }
 
           save_backup() {
             echo "[*] Saving /home/$SSH_USER backup to GitHub Releases..."
@@ -134,33 +132,18 @@ jobs:
             fi
           }
 
+          START_TS=$(date +%s)
+          LAST_TS=$START_TS
+          start_tunnel
+
           while true; do
             NOW_TS=$(date +%s)
             ELAPSED_MIN=$(( (NOW_TS - START_TS) / 60 ))
             SINCE_SAVE=$(( (NOW_TS - LAST_TS) / 60 ))
 
             if ! kill -0 "$CUR_PID" 2>/dev/null; then
-              echo "[!] bore disconnected, restarting..."
-              sudo rm -f /tmp/bore.log
-              nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
-              CUR_PID=$!
-              for i in $(seq 1 15); do
-                sleep 2
-                if grep -q "listening at bore.pub:" /tmp/bore.log 2>/dev/null; then
-                  break
-                fi
-              done
-              NEW_HOST=$(grep -oE "bore\.pub:[0-9]+" /tmp/bore.log | head -1)
-              if [ -n "$NEW_HOST" ]; then
-                BORE_HOST="$NEW_HOST"
-                NEW_PORT="${NEW_HOST#*:}"
-                MSG="VEXOR+Ubuntu+Reconnected%0A%F0%9F%96%A5+Host%3A+$NEW_HOST%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%92%BB+ssh+$SSH_USER%40bore.pub+-p+$NEW_PORT"
-                IFS=',' read -ra CHATS <<< "$TG_CHATS"
-                for CHAT_ID in "${CHATS[@]}"; do
-                  CHAT_ID=$(echo "$CHAT_ID" | xargs)
-                  [ -n "$CHAT_ID" ] && curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${MSG}" >/dev/null
-                done
-              fi
+              echo "[!] Tunnel disconnected, reconnecting to unified port $FIXED_PORT..."
+              start_tunnel
             fi
 
             if [ "$SINCE_SAVE" -ge 45 ] && [ "$ELAPSED_MIN" -lt 340 ]; then
@@ -169,7 +152,8 @@ jobs:
             fi
 
             if [ "$ELAPSED_MIN" -ge 348 ]; then
-              echo "[*] Session reaching 6h limit, moving to final save & restart..."
+              echo "[*] Releasing unified port $FIXED_PORT before next session..."
+              kill -9 "$CUR_PID" 2>/dev/null || true
               break
             fi
 
@@ -186,7 +170,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
           set +e
-          echo "[*] Running final backup before triggering next session..."
+          sudo killall -9 bore 2>/dev/null || true
           sudo rm -f /tmp/ubuntu_delta.tar.gz
           sudo tar --exclude='.cache' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/home/$SSH_USER" . 2>/dev/null
           if [ -f /tmp/ubuntu_delta.tar.gz ]; then
@@ -197,7 +181,6 @@ jobs:
             sudo rm -f /tmp/ubuntu_delta.tar.gz
           fi
 
-          echo "[*] Triggering next Ubuntu VPS session..."
           curl -s -X POST \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
