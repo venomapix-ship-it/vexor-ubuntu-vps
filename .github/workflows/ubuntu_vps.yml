@@ -42,6 +42,7 @@ jobs:
           sudo sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
           sudo mkdir -p /run/sshd
           sudo systemctl restart ssh || sudo service ssh restart
+          echo "[+] SSH ready for user: $SSH_USER"
 
       - name: Restore Encrypted Backup & Auto-Start VEXOR Bot
         env:
@@ -61,12 +62,17 @@ jobs:
             sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME"
             sudo rm -f "/tmp/ubuntu_delta.tar.gz" "/tmp/ubuntu_delta.tar.gz.enc"
           elif gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
-            echo "[+] Restoring previous backup..."
+            echo "[+] Restoring previous unencrypted backup..."
             sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME"
             sudo rm -f "/tmp/ubuntu_delta.tar.gz"
           elif [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
             echo "[+] First run: Extracting bot1.zip..."
             sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
+          fi
+
+          REQ_FILE=$(find "$BOT_DIR" -maxdepth 3 -name "requirements.txt" | head -1)
+          if [ -n "$REQ_FILE" ]; then
+            sudo pip3 install --break-system-packages -q -r "$REQ_FILE" || true
           fi
 
           cat << 'BOTEOF' | sudo tee "$USER_HOME/run_bot.sh" >/dev/null
@@ -127,9 +133,12 @@ jobs:
                   BORE_PORT="$FIXED_PORT"
                   break 2
                 fi
+                if ! kill -0 "$CUR_PID" 2>/dev/null; then
+                  break
+                fi
               done
               kill -9 "$CUR_PID" 2>/dev/null || true
-              sleep 5
+              sleep 4
             done
 
             if [ -z "$BORE_PORT" ]; then
@@ -139,7 +148,10 @@ jobs:
               for i in $(seq 1 15); do
                 sleep 2
                 if grep -q "listening at" /tmp/bore.log 2>/dev/null; then
-                  BORE_PORT=$(grep -oE ":[0-9]+" /tmp/bore.log | head -1 | tr -d ':')
+                  BORE_PORT=$(grep -oE "${RELAY_IP}:[0-9]+" /tmp/bore.log | head -1 | cut -d: -f2)
+                  break
+                fi
+                if ! kill -0 "$CUR_PID" 2>/dev/null; then
                   break
                 fi
               done
@@ -181,13 +193,11 @@ jobs:
             ELAPSED_MIN=$(( (NOW_TS - START_TS) / 60 ))
             SINCE_SAVE=$(( (NOW_TS - LAST_TS) / 60 ))
 
-            # التأكد أن البوت شغال داخل tmux
             if ! sudo -u "$SSH_USER" tmux has-session -t bot 2>/dev/null; then
               sudo -u "$SSH_USER" tmux new-session -d -s bot "bash /home/$SSH_USER/run_bot.sh"
             fi
 
-            # فحص العملية + فحص استجابة البورت الفعلية
-            if ! kill -0 "$CUR_PID" 2>/dev/null || ! nc -z -w 5 "$RELAY_IP" "$BORE_PORT" 2>/dev/null; then
+            if [ -z "$BORE_PORT" ] || ! kill -0 "$CUR_PID" 2>/dev/null || ! nc -z -w 5 "$RELAY_IP" "$BORE_PORT" 2>/dev/null; then
               echo "[!] Tunnel unresponsive, reconnecting..."
               kill -9 "$CUR_PID" 2>/dev/null || true
               sleep 3
