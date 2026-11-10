@@ -19,13 +19,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Ubuntu User, SSH & Dependencies
+      - name: Setup Ubuntu User, SSH & Bot Dependencies
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv curl wget jq >/dev/null
+          sudo apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv curl wget jq netcat-openbsd openssl >/dev/null
+
+          echo "PIP_BREAK_SYSTEM_PACKAGES=1" | sudo tee -a /etc/environment >/dev/null
+          sudo pip3 install --break-system-packages -q requests urllib3 PySocks cryptography asn1crypto
 
           if ! id "$SSH_USER" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash "$SSH_USER"
@@ -40,25 +43,62 @@ jobs:
           sudo mkdir -p /run/sshd
           sudo systemctl restart ssh || sudo service ssh restart
 
-      - name: Restore Backup or Extract bot1.zip
+      - name: Restore Encrypted Backup & Auto-Start VEXOR Bot
         env:
+          RUNNER_TRACKING_ID: ""
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_REPO:  ${{ github.repository }}
           SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           USER_HOME="/home/$SSH_USER"
           BOT_DIR="$USER_HOME/bot"
           sudo mkdir -p "$BOT_DIR"
 
-          if gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
+          if gh release download "delta-backup" -p "ubuntu_delta.tar.gz.enc" -O "/tmp/ubuntu_delta.tar.gz.enc" --repo "$GH_REPO" 2>/dev/null; then
+            echo "[+] Restoring encrypted backup..."
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in "/tmp/ubuntu_delta.tar.gz.enc" -out "/tmp/ubuntu_delta.tar.gz"
+            sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME"
+            sudo rm -f "/tmp/ubuntu_delta.tar.gz" "/tmp/ubuntu_delta.tar.gz.enc"
+          elif gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
+            echo "[+] Restoring previous backup..."
             sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME"
             sudo rm -f "/tmp/ubuntu_delta.tar.gz"
           elif [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
+            echo "[+] First run: Extracting bot1.zip..."
             sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
           fi
+
+          cat << 'BOTEOF' | sudo tee "$USER_HOME/run_bot.sh" >/dev/null
+          #!/bin/bash
+          export PIP_BREAK_SYSTEM_PACKAGES=1
+          BOT_FILE=$(find "$HOME/bot" -maxdepth 3 -name "bot.py" | head -1)
+          if [ -z "$BOT_FILE" ]; then
+            echo "[!] bot.py not found in ~/bot"
+            sleep 3600
+            exit 0
+          fi
+          cd "$(dirname "$BOT_FILE")"
+          while true; do
+            echo "🤖 [$(date '+%H:%M:%S')] Starting VEXOR Bot..."
+            if [ -f .env ]; then
+              set -a
+              source .env
+              set +a
+            fi
+            python3 -u bot.py
+            echo "⚠️ Bot stopped! Restarting in 5 seconds..."
+            sleep 5
+          done
+          BOTEOF
+
+          sudo chmod +x "$USER_HOME/run_bot.sh"
           sudo chown -R "$SSH_USER:$SSH_USER" "$USER_HOME"
 
-      - name: Static IP & Unified Port Tunnel + Watchdog (45m Backup)
+          sudo -u "$SSH_USER" tmux new-session -d -s bot "bash $USER_HOME/run_bot.sh"
+          echo "[+] VEXOR Bot started automatically in tmux session 'bot'"
+
+      - name: Static IP & Unified Port Tunnel + Watchdog (45m Encrypted Backup)
         env:
           RUNNER_TRACKING_ID: ""
           GH_TOKEN:     ${{ secrets.GH_PAT }}
@@ -77,7 +117,6 @@ jobs:
 
           start_tunnel() {
             BORE_PORT=""
-            # محاولة حجز البورت الموحد 54822 ثلاث مرات
             for attempt in 1 2 3; do
               sudo rm -f /tmp/bore.log
               nohup bore local 22 --to "$RELAY_IP" --port "$FIXED_PORT" > /tmp/bore.log 2>&1 &
@@ -93,7 +132,6 @@ jobs:
               sleep 5
             done
 
-            # في حال كان البورت 54822 مشغولاً، يفتح بورت احتياطي حتى لا يتوقف السيرفر
             if [ -z "$BORE_PORT" ]; then
               sudo rm -f /tmp/bore.log
               nohup bore local 22 --to "$RELAY_IP" > /tmp/bore.log 2>&1 &
@@ -109,7 +147,7 @@ jobs:
 
             if [ -n "$BORE_PORT" ]; then
               BORE_HOST="${RELAY_IP}:${BORE_PORT}"
-              MSG="VEXOR+Ubuntu+VPS+Ready%0A%F0%9F%96%A5+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%92%BB+Termux%3A+ssh+$SSH_USER%40$RELAY_IP+-p+$BORE_PORT"
+              MSG="VEXOR+Ubuntu+VPS+Ready+%28Bot+Auto-Running%29%0A%F0%9F%96%A5+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%A4%96+Bot+Logs%3A+tmux+attach+-t+bot%0A%F0%9F%92%BB+Termux%3A+ssh+$SSH_USER%40$RELAY_IP+-p+$BORE_PORT"
               IFS=',' read -ra CHATS <<< "$TG_CHATS"
               for CHAT_ID in "${CHATS[@]}"; do
                 CHAT_ID=$(echo "$CHAT_ID" | xargs)
@@ -119,16 +157,18 @@ jobs:
           }
 
           save_backup() {
-            echo "[*] Saving /home/$SSH_USER backup to GitHub Releases..."
-            sudo rm -f /tmp/ubuntu_delta.tar.gz
+            echo "[*] Saving encrypted /home/$SSH_USER backup to GitHub Releases..."
+            sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
             sudo tar --exclude='.cache' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/home/$SSH_USER" . 2>/dev/null
             if [ -f /tmp/ubuntu_delta.tar.gz ]; then
               sudo chmod 644 /tmp/ubuntu_delta.tar.gz
+              openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /tmp/ubuntu_delta.tar.gz -out /tmp/ubuntu_delta.tar.gz.enc
               gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
-                gh release create "delta-backup" --title "Delta Backup" --notes "Automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
-              gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz#ubuntu_delta.tar.gz" --clobber --repo "$GH_REPO" >/dev/null 2>&1 && \
-                echo "[+] Backup uploaded OK" || echo "[!] Backup upload warning"
-              sudo rm -f /tmp/ubuntu_delta.tar.gz
+                gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
+              gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1 && \
+                echo "[+] Encrypted backup uploaded OK" || echo "[!] Backup upload warning"
+              gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
+              sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
             fi
           }
 
@@ -141,8 +181,16 @@ jobs:
             ELAPSED_MIN=$(( (NOW_TS - START_TS) / 60 ))
             SINCE_SAVE=$(( (NOW_TS - LAST_TS) / 60 ))
 
-            if ! kill -0 "$CUR_PID" 2>/dev/null; then
-              echo "[!] Tunnel disconnected, reconnecting to unified port $FIXED_PORT..."
+            # التأكد أن البوت شغال داخل tmux
+            if ! sudo -u "$SSH_USER" tmux has-session -t bot 2>/dev/null; then
+              sudo -u "$SSH_USER" tmux new-session -d -s bot "bash /home/$SSH_USER/run_bot.sh"
+            fi
+
+            # فحص العملية + فحص استجابة البورت الفعلية
+            if ! kill -0 "$CUR_PID" 2>/dev/null || ! nc -z -w 5 "$RELAY_IP" "$BORE_PORT" 2>/dev/null; then
+              echo "[!] Tunnel unresponsive, reconnecting..."
+              kill -9 "$CUR_PID" 2>/dev/null || true
+              sleep 3
               start_tunnel
             fi
 
@@ -157,28 +205,31 @@ jobs:
               break
             fi
 
-            echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST}"
+            echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST} | bot=running"
             sleep 60
           done
 
-      - name: Final Backup & Guaranteed Auto-Restart
+      - name: Final Encrypted Backup & Guaranteed Auto-Restart
         if: always() && inputs.auto_restart == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_REPO:  ${{ github.repository }}
           GH_REF:   ${{ github.ref_name }}
           SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
           sudo killall -9 bore 2>/dev/null || true
-          sudo rm -f /tmp/ubuntu_delta.tar.gz
+          sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
           sudo tar --exclude='.cache' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/home/$SSH_USER" . 2>/dev/null
           if [ -f /tmp/ubuntu_delta.tar.gz ]; then
             sudo chmod 644 /tmp/ubuntu_delta.tar.gz
+            openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /tmp/ubuntu_delta.tar.gz -out /tmp/ubuntu_delta.tar.gz.enc
             gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
-              gh release create "delta-backup" --title "Delta Backup" --notes "Automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
-            gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz#ubuntu_delta.tar.gz" --clobber --repo "$GH_REPO" >/dev/null 2>&1
-            sudo rm -f /tmp/ubuntu_delta.tar.gz
+              gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
+            gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
+            gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
+            sudo rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
           fi
 
           curl -s -X POST \
