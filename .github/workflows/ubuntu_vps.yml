@@ -55,7 +55,7 @@ jobs:
           if gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
             echo "[+] Restoring previous session files..."
             sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "$USER_HOME"
-            rm -f "/tmp/ubuntu_delta.tar.gz"
+            sudo rm -f "/tmp/ubuntu_delta.tar.gz"
           elif [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
             echo "[+] First run: Extracting bot1.zip to $BOT_DIR ..."
             sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
@@ -67,6 +67,7 @@ jobs:
       - name: Install bore & Start SSH Tunnel
         id: tunnel
         env:
+          RUNNER_TRACKING_ID: ""
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHATS: ${{ secrets.TG_CHATS }}
           SSH_USER: ${{ secrets.SSH_USER }}
@@ -103,31 +104,33 @@ jobs:
           echo "bore_pid=$BORE_PID" >> $GITHUB_OUTPUT
           echo "BORE_HOST=$BORE_HOST" >> $GITHUB_ENV
 
-      - name: Watchdog + Auto-Save + Auto-Restart
+      - name: Watchdog + Auto-Save (Every 45m)
         env:
+          RUNNER_TRACKING_ID: ""
           GH_TOKEN:     ${{ secrets.GH_PAT }}
           GH_REPO:      ${{ github.repository }}
-          GH_REF:       ${{ github.ref_name }}
           TG_TOKEN:     ${{ secrets.TG_TOKEN }}
           TG_CHATS:     ${{ secrets.TG_CHATS }}
           SSH_USER:     ${{ secrets.SSH_USER }}
           SSH_PASS:     ${{ secrets.SSH_PASS }}
-          AUTO_RESTART: ${{ inputs.auto_restart }}
           BORE_PID:     ${{ steps.tunnel.outputs.bore_pid }}
         run: |
+          set +e
           START_TS=$(date +%s)
           LAST_TS=$START_TS
           CUR_PID="$BORE_PID"
 
           save_backup() {
             echo "[*] Saving /home/$SSH_USER backup to GitHub Releases..."
-            sudo tar --exclude='.cache' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/home/$SSH_USER" . 2>/dev/null || true
+            sudo rm -f /tmp/ubuntu_delta.tar.gz
+            sudo tar --exclude='.cache' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/home/$SSH_USER" . 2>/dev/null
             if [ -f /tmp/ubuntu_delta.tar.gz ]; then
+              sudo chmod 644 /tmp/ubuntu_delta.tar.gz
               gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
-                gh release create "delta-backup" --title "Delta Backup" --notes "Automated state backup" --repo "$GH_REPO" >/dev/null 2>&1 || true
+                gh release create "delta-backup" --title "Delta Backup" --notes "Automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
               gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz#ubuntu_delta.tar.gz" --clobber --repo "$GH_REPO" >/dev/null 2>&1 && \
                 echo "[+] Backup uploaded OK" || echo "[!] Backup upload warning"
-              rm -f /tmp/ubuntu_delta.tar.gz
+              sudo rm -f /tmp/ubuntu_delta.tar.gz
             fi
           }
 
@@ -138,18 +141,24 @@ jobs:
 
             if ! kill -0 "$CUR_PID" 2>/dev/null; then
               echo "[!] bore disconnected, restarting..."
-              rm -f /tmp/bore.log
+              sudo rm -f /tmp/bore.log
               nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
               CUR_PID=$!
-              sleep 5
-              NEW_HOST=$(grep -oE "bore\.pub:[0-9]+" /tmp/bore.log | head -1 || true)
+              for i in $(seq 1 15); do
+                sleep 2
+                if grep -q "listening at bore.pub:" /tmp/bore.log 2>/dev/null; then
+                  break
+                fi
+              done
+              NEW_HOST=$(grep -oE "bore\.pub:[0-9]+" /tmp/bore.log | head -1)
               if [ -n "$NEW_HOST" ]; then
+                BORE_HOST="$NEW_HOST"
                 NEW_PORT="${NEW_HOST#*:}"
                 MSG="VEXOR+Ubuntu+Reconnected%0A%F0%9F%96%A5+Host%3A+$NEW_HOST%0A%F0%9F%91%A4+User%3A+$SSH_USER%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%92%BB+ssh+$SSH_USER%40bore.pub+-p+$NEW_PORT"
                 IFS=',' read -ra CHATS <<< "$TG_CHATS"
                 for CHAT_ID in "${CHATS[@]}"; do
                   CHAT_ID=$(echo "$CHAT_ID" | xargs)
-                  [ -n "$CHAT_ID" ] && curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${MSG}" >/dev/null || true
+                  [ -n "$CHAT_ID" ] && curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${MSG}" >/dev/null
                 done
               fi
             fi
@@ -159,17 +168,39 @@ jobs:
               LAST_TS=$(date +%s)
             fi
 
-            if [ "$ELAPSED_MIN" -ge 348 ] && [ "$AUTO_RESTART" = "true" ]; then
-              save_backup
-              curl -s -X POST \
-                -H "Authorization: token $GH_TOKEN" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/dispatches" \
-                -d "{\"ref\":\"$GH_REF\",\"inputs\":{\"auto_restart\":\"true\"}}" >/dev/null 2>&1 || true
-              echo "[+] Next Ubuntu session triggered!"
+            if [ "$ELAPSED_MIN" -ge 348 ]; then
+              echo "[*] Session reaching 6h limit, moving to final save & restart..."
               break
             fi
 
             echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST}"
             sleep 60
           done
+
+      - name: Final Backup & Guaranteed Auto-Restart
+        if: always() && inputs.auto_restart == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_REPO:  ${{ github.repository }}
+          GH_REF:   ${{ github.ref_name }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set +e
+          echo "[*] Running final backup before triggering next session..."
+          sudo rm -f /tmp/ubuntu_delta.tar.gz
+          sudo tar --exclude='.cache' --exclude='*.log' -czf /tmp/ubuntu_delta.tar.gz -C "/home/$SSH_USER" . 2>/dev/null
+          if [ -f /tmp/ubuntu_delta.tar.gz ]; then
+            sudo chmod 644 /tmp/ubuntu_delta.tar.gz
+            gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
+              gh release create "delta-backup" --title "Delta Backup" --notes "Automated state backup" --repo "$GH_REPO" >/dev/null 2>&1
+            gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz#ubuntu_delta.tar.gz" --clobber --repo "$GH_REPO" >/dev/null 2>&1
+            sudo rm -f /tmp/ubuntu_delta.tar.gz
+          fi
+
+          echo "[*] Triggering next Ubuntu VPS session..."
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/dispatches" \
+            -d "{\"ref\":\"$GH_REF\",\"inputs\":{\"auto_restart\":\"true\"}}"
+          echo "[+] Next Ubuntu session triggered!"
