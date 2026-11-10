@@ -27,10 +27,17 @@ jobs:
           GH_REPO:  ${{ github.repository }}
           RELAY_IP: "159.223.110.159"
         run: |
-          # تعيين اسم السيرفر رسمياً إلى VEXOR_iBOT
+          # 1. تغيير اسم السيرفر بشكل إجباري وشامل
           sudo hostnamectl set-hostname VEXOR_iBOT 2>/dev/null || sudo hostname VEXOR_iBOT
           echo "VEXOR_iBOT" | sudo tee /etc/hostname >/dev/null
           sudo sed -i 's/127.0.1.1.*/127.0.1.1 VEXOR_iBOT/' /etc/hosts 2>/dev/null || echo "127.0.1.1 VEXOR_iBOT" | sudo tee -a /etc/hosts >/dev/null
+          
+          # تثبيت اسم VEXOR_iBOT في كل شاشات الـ SSH و Bash
+          cat << 'PEOF' | sudo tee /etc/profile.d/vps_prompt.sh >/dev/null
+          export HOSTNAME="VEXOR_iBOT"
+          export PS1='\[\033[01;32m\]root@VEXOR_iBOT\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '
+          PEOF
+          sudo chmod +x /etc/profile.d/vps_prompt.sh
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv python3-full curl wget jq netcat-openbsd openssl git build-essential cron htop lsof >/dev/null
@@ -132,7 +139,7 @@ jobs:
 
           sudo chmod +x /usr/local/bin/vps-apt /usr/local/bin/add-bot /usr/local/bin/open-port /usr/local/bin/close-port /usr/local/bin/vps-status
 
-      - name: Restore Root Backup, SSH Identity, Packages & Services
+      - name: Restore Root Backup, SSH Identity, Migrate Files & Start Bot
         env:
           RUNNER_TRACKING_ID: ""
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -140,30 +147,43 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
-          USER_HOME="/root"
           BOT_DIR="/root/bot"
           SYS_DIR="/root/.vps_system"
           sudo mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/systemd_services" "/root/autostart"
 
-          if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
-            sudo rm -rf "/home/$SSH_USER"
-            sudo ln -s /root "/home/$SSH_USER"
-          fi
-
+          # فك النسخ الاحتياطية
           if gh release download "delta-backup" -p "ubuntu_delta.tar.gz.enc" -O "/tmp/ubuntu_delta.tar.gz.enc" --repo "$GH_REPO" 2>/dev/null; then
-            echo "[+] Restoring encrypted backup into /root..."
+            echo "[+] Restoring encrypted backup..."
             openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in "/tmp/ubuntu_delta.tar.gz.enc" -out "/tmp/ubuntu_delta.tar.gz"
             sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
             sudo rm -f "/tmp/ubuntu_delta.tar.gz" "/tmp/ubuntu_delta.tar.gz.enc"
           elif gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
-            echo "[+] Restoring previous unencrypted backup into /root..."
+            echo "[+] Restoring previous unencrypted backup..."
             sudo tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
             sudo rm -f "/tmp/ubuntu_delta.tar.gz"
-          elif [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
-            echo "[+] First run: Extracting bot1.zip..."
-            sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
           fi
 
+          # نقل أي ملفات كانت موجودة في مسار vexor القديم إلى /root
+          if [ -d "/home/$SSH_USER" ] && [ ! -L "/home/$SSH_USER" ]; then
+            echo "[*] Migrating previous files from /home/$SSH_USER to /root..."
+            sudo cp -rn "/home/$SSH_USER/." /root/ 2>/dev/null || true
+            sudo rm -rf "/home/$SSH_USER"
+          fi
+
+          # ربط مسار /home/$SSH_USER القديم بـ /root حتى تعمل كل السكربتات القديمة
+          if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
+            sudo ln -sfn /root "/home/$SSH_USER"
+          fi
+
+          # إذا كان البوت غير موجود بعد الاسترجاع، استخراجه من bot1.zip
+          if [ ! -d "/root/bot" ] || [ -z "$(ls -A /root/bot 2>/dev/null)" ]; then
+            if [ -f "$GITHUB_WORKSPACE/bot1.zip" ]; then
+              echo "[+] Extracting bot1.zip to /root/bot..."
+              sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
+            fi
+          fi
+
+          # تثبيت مفاتيح SSH الثابتة
           if ls "$SYS_DIR/ssh_keys/ssh_host_"* >/dev/null 2>&1; then
             sudo cp -f "$SYS_DIR/ssh_keys/ssh_host_"* /etc/ssh/
             sudo chmod 600 /etc/ssh/ssh_host_*_key
@@ -182,7 +202,6 @@ jobs:
           sudo mkdir -p /run/sshd
           sudo systemctl restart ssh || sudo service ssh restart
 
-          # ضبط سطر الأوامر (Prompt) في bashrc ليظهر root@VEXOR_iBOT:~# بشكل دائم
           grep -q "VEXOR_iBOT" /root/.bashrc 2>/dev/null || cat << 'BEOF' | sudo tee -a /root/.bashrc >/dev/null
           export PIP_USER=1
           export PIP_BREAK_SYSTEM_PACKAGES=1
