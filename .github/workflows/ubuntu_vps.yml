@@ -19,7 +19,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Full Root VPS Environment & Helper Tools
+      - name: Setup Full Root VPS Environment & Hostname VEXOR_iBOT
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
@@ -27,10 +27,14 @@ jobs:
           GH_REPO:  ${{ github.repository }}
           RELAY_IP: "159.223.110.159"
         run: |
+          # تعيين اسم السيرفر رسمياً إلى VEXOR_iBOT
+          sudo hostnamectl set-hostname VEXOR_iBOT 2>/dev/null || sudo hostname VEXOR_iBOT
+          echo "VEXOR_iBOT" | sudo tee /etc/hostname >/dev/null
+          sudo sed -i 's/127.0.1.1.*/127.0.1.1 VEXOR_iBOT/' /etc/hosts 2>/dev/null || echo "127.0.1.1 VEXOR_iBOT" | sudo tee -a /etc/hosts >/dev/null
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv python3-full curl wget jq netcat-openbsd openssl git build-essential cron htop lsof >/dev/null
 
-          # تسجيل قائمة الحزم والخدمات الافتراضية لاكتشاف أي حزمة أو خدمة يثبتها المستخدم لاحقاً بشكل تلقائي
           apt-mark showmanual | sort > /etc/vps_base_pkgs.txt
           ls -1 /etc/systemd/system > /etc/vps_base_systemd.txt
 
@@ -113,8 +117,8 @@ jobs:
 
           cat << 'EOF' | sudo tee /usr/local/bin/vps-status >/dev/null
           #!/bin/bash
-          echo "=== VEXOR ROOT FULL VPS STATUS ==="
-          echo "[*] User:   $(whoami) (Home: $HOME)"
+          echo "=== VEXOR_iBOT FULL VPS STATUS ==="
+          echo "[*] Host:   $(hostname) (User: $(whoami))"
           echo "[*] Uptime: $(uptime -p)"
           echo "[*] Memory: $(free -h | awk '/^Mem:/ {print $3 " / " $2}')"
           echo "[*] Disk:   $(df -h / | awk 'NR==2 {print $3 " / " $2}')"
@@ -141,7 +145,6 @@ jobs:
           SYS_DIR="/root/.vps_system"
           sudo mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/systemd_services" "/root/autostart"
 
-          # ربط /home/$SSH_USER بـ /root لضمان عمل أي مسار قديم بدون مشاكل
           if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
             sudo rm -rf "/home/$SSH_USER"
             sudo ln -s /root "/home/$SSH_USER"
@@ -161,7 +164,6 @@ jobs:
             sudo unzip -q -o "$GITHUB_WORKSPACE/bot1.zip" -d "$BOT_DIR"
           fi
 
-          # استعادة بصمة مفاتيح SSH الثابتة
           if ls "$SYS_DIR/ssh_keys/ssh_host_"* >/dev/null 2>&1; then
             sudo cp -f "$SYS_DIR/ssh_keys/ssh_host_"* /etc/ssh/
             sudo chmod 600 /etc/ssh/ssh_host_*_key
@@ -180,21 +182,20 @@ jobs:
           sudo mkdir -p /run/sshd
           sudo systemctl restart ssh || sudo service ssh restart
 
-          # حفظ مكتبات بايثون تلقائياً داخل /root/.local
-          grep -q "PYTHONUSERBASE=" /root/.bashrc 2>/dev/null || cat << 'BEOF' | sudo tee -a /root/.bashrc >/dev/null
+          # ضبط سطر الأوامر (Prompt) في bashrc ليظهر root@VEXOR_iBOT:~# بشكل دائم
+          grep -q "VEXOR_iBOT" /root/.bashrc 2>/dev/null || cat << 'BEOF' | sudo tee -a /root/.bashrc >/dev/null
           export PIP_USER=1
           export PIP_BREAK_SYSTEM_PACKAGES=1
           export PYTHONUSERBASE="/root/.local"
           export PATH="/root/.local/bin:$PATH"
+          export PS1='\[\033[01;32m\]root@VEXOR_iBOT\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '
           BEOF
 
-          # إعادة تثبيت كل الحزم التي ثبتها المستخدم بـ apt install أو vps-apt
           if [ -s "$SYS_DIR/apt_packages.txt" ]; then
             echo "[+] Reinstalling persistent apt packages..."
             xargs -a "$SYS_DIR/apt_packages.txt" sudo apt-get install -y -qq >/dev/null 2>&1 || true
           fi
 
-          # استعادة وتشغيل أي خدمات systemd أنشأها المستخدم
           if ls "$SYS_DIR/systemd_services/"*.service >/dev/null 2>&1; then
             echo "[+] Restoring custom systemd services..."
             sudo cp -f "$SYS_DIR/systemd_services/"*.service /etc/systemd/system/
@@ -205,12 +206,10 @@ jobs:
             done
           fi
 
-          # استعادة مهام Crontab لـ root
           if [ -s "$SYS_DIR/user.cron" ]; then
             sudo crontab "$SYS_DIR/user.cron" 2>/dev/null || true
           fi
 
-          # تثبيت متطلبات أي بوت موجود داخل /root
           find /root -maxdepth 3 -name "requirements.txt" 2>/dev/null | while read -r req; do
             sudo PIP_USER=1 PYTHONUSERBASE="/root/.local" pip3 install --break-system-packages -q -r "$req" 2>/dev/null || true
           done
@@ -228,7 +227,7 @@ jobs:
           fi
           cd "$(dirname "$BOT_FILE")"
           while true; do
-            echo "🤖 [$(date '+%H:%M:%S')] Starting VEXOR Bot as root..."
+            echo "🤖 [$(date '+%H:%M:%S')] Starting VEXOR Bot as root@VEXOR_iBOT..."
             if [ -f .env ]; then
               set -a
               source .env
@@ -306,7 +305,7 @@ jobs:
 
             if [ -n "$BORE_PORT" ]; then
               BORE_HOST="${RELAY_IP}:${BORE_PORT}"
-              MSG="VEXOR+ROOT+VPS+Ready+%28100%25+Full+Root%29%0A%F0%9F%96%A5+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+root%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%A4%96+Bot+Logs%3A+tmux+attach+-t+bot%0A%F0%9F%9B%A0+Status%3A+vps-status%0A%F0%9F%92%BB+Termux%3A+ssh+root%40$RELAY_IP+-p+$BORE_PORT"
+              MSG="VEXOR_iBOT+Root+VPS+Ready%0A%F0%9F%96%A5+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+root%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%A4%96+Bot+Logs%3A+tmux+attach+-t+bot%0A%F0%9F%9B%A0+Status%3A+vps-status%0A%F0%9F%92%BB+Termux%3A+ssh+root%40$RELAY_IP+-p+$BORE_PORT"
               send_tg "$MSG"
             fi
           }
@@ -352,13 +351,11 @@ jobs:
             sudo crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
             sudo cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
 
-            # التقاط أي حزمة ثبتها المستخدم بـ apt install تلقائياً
             if [ -f /etc/vps_base_pkgs.txt ]; then
               comm -13 /etc/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
               [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
             fi
 
-            # التقاط أي خدمة systemd جديدة أنشأها المستخدم في /etc/systemd/system
             if [ -f /etc/vps_base_systemd.txt ]; then
               comm -13 /etc/vps_base_systemd.txt <(ls -1 /etc/systemd/system | sort) | grep '\.service$' | while read -r new_svc; do
                 [ -f "/etc/systemd/system/$new_svc" ] && sudo cp -f "/etc/systemd/system/$new_svc" "$SYS_DIR/systemd_services/" 2>/dev/null || true
@@ -441,7 +438,7 @@ jobs:
               break
             fi
 
-            echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST} | root_vps=active"
+            echo "[~] ${ELAPSED_MIN}m | pid=${CUR_PID} | ${BORE_HOST} | host=VEXOR_iBOT"
             sleep 60
           done
 
