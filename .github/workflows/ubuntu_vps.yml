@@ -28,21 +28,22 @@ jobs:
           RELAY_IP: "159.223.110.159"
         run: |
           set +e
+          cd /root
           export DEBIAN_FRONTEND=noninteractive
 
           mkdir -p /run/.outer_wd
           chmod 700 /run/.outer_wd
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
 
-          # سحب bot1.zip عبر الـ API فقط في أول مرة دون عمل git clone للمستودع أبداً
+          # سحب bot1.zip عبر الـ API فقط في أول مرة دون عمل git clone للمستودع
           if ! gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1; then
             curl -sL -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3.raw" \
               "https://api.github.com/repos/$GH_REPO/contents/bot1.zip" -o /run/.outer_wd/init_bot.zip 2>/dev/null || true
           fi
 
-          # حذف مجلد المستودع فقط إن وُجد دون لمس _temp الخاص بالـ Runner الخارجي
-          rm -rf "$GITHUB_WORKSPACE" /home/runner/work/vexor-ubuntu-vps 2>/dev/null || true
+          # تفريغ محتويات مجلد العمل دون حذف المجلد نفسه لتجنب خطأ المسار
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github 2>/dev/null || true
 
           cat << 'ENVEOF' > /etc/environment
           PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -62,9 +63,9 @@ jobs:
           PEOF
           chmod +x /etc/profile.d/vps_prompt.sh
 
-          # حجب عناوين Metadata الخاصة بـ Azure وتقليل رسائل الكيرنل
+          # حجب بورت HTTP (80) فقط لـ Metadata مع ترك DNS (بورت 53) شغالاً 100%
           iptables -I OUTPUT -d 169.254.169.254 -j DROP 2>/dev/null || true
-          iptables -I OUTPUT -d 168.63.129.16 -j DROP 2>/dev/null || true
+          iptables -I OUTPUT -p tcp -d 168.63.129.16 --dport 80 -j DROP 2>/dev/null || true
           sysctl -w kernel.dmesg_restrict=1 >/dev/null 2>&1 || true
 
           apt-get update -qq
@@ -216,6 +217,7 @@ jobs:
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
+          cd /root
           export DEBIAN_FRONTEND=noninteractive
           chmod 755 /root
           BOT_DIR="/root/bot"
@@ -258,7 +260,6 @@ jobs:
             cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
           fi
 
-          # إعداد sshd مع تعطيل UsePAM لمنع الاتصال بـ systemd-logind الخارجي وتسريع الدخول
           sed -i 's/^#*UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
           sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
@@ -318,7 +319,6 @@ jobs:
           BOTEOF
           chmod +x /root/run_bot.sh
 
-          # تجهيز نسخ منظفة من /etc/passwd و /etc/group خالية من حسابات runner
           grep -vE '^(runner|runneradmin):' /etc/passwd > /run/.outer_wd/clean_passwd
           grep -vE '^(runner|runneradmin|docker):' /etc/group > /run/.outer_wd/clean_group
           chmod 644 /run/.outer_wd/clean_passwd /run/.outer_wd/clean_group
@@ -331,18 +331,15 @@ jobs:
           mount --make-rprivate /
           mount -t proc proc /proc
 
-          # 1. تركيب ملفات الهوية المنظفة بدون runner
           mount --bind /run/.outer_wd/clean_passwd /etc/passwd
           mount --bind /run/.outer_wd/clean_group /etc/group
 
-          # 2. إخفاء كافة مسارات الـ Runner ومقابس systemd/dbus وسجلات السحابة
           for mdir in /home/runner /home/runneradmin /opt/runner /opt/actionarchivecache /run/.outer_wd /run/systemd /run/dbus /var/lib/cloud /var/lib/waagent /mnt; do
             [ -d "$mdir" ] && mount -t tmpfs -o size=1M,mode=000 tmpfs "$mdir" 2>/dev/null || true
           done
           mount -t tmpfs -o size=2G,mode=1777 tmpfs /tmp
           mount -t tmpfs -o size=64M,mode=0755 tmpfs /var/log
 
-          # 3. إنشاء /dev معزول خالٍ من أقراص البلوك الخام (/dev/sda*, /dev/root, /dev/mem) لمنع debugfs
           mkdir -p /tmp/.clean_dev
           mount -t tmpfs -o size=16M,mode=0755 tmpfs /tmp/.clean_dev
           for devnode in null zero full random urandom tty fuse; do
@@ -361,7 +358,6 @@ jobs:
           ln -s pts/ptmx /tmp/.clean_dev/ptmx
           mount --move /tmp/.clean_dev /dev
 
-          # 4. إسقاط صلاحيات النواة الخطرة (بما فيها cap_mknod و cap_sys_admin و cap_sys_rawio)
           DROP_CAPS="cap_sys_admin,cap_sys_module,cap_sys_rawio,cap_sys_boot,cap_sys_ptrace,cap_net_admin,cap_mac_admin,cap_mac_override,cap_syslog,cap_mknod,cap_audit_control"
 
           exec capsh --drop="$DROP_CAPS" -- -c '
@@ -463,6 +459,7 @@ jobs:
           FIXED_PORT: "54822"
         run: |
           set +e
+          cd /root
           SYS_DIR="/root/.vps_system"
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
 
@@ -605,6 +602,7 @@ jobs:
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
+          cd /root
           [ ! -f /run/.outer_wd/vps_restore_complete ] && exit 0
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
           SYS_DIR="/root/.vps_system"
