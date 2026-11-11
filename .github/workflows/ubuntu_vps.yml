@@ -19,7 +19,7 @@ jobs:
         shell: sudo -E bash {0}
 
     steps:
-      - name: Fast Boot Hardened VPS, Restore & Watchdog
+      - name: Full Unrestricted Root VPS, Restore & Watchdog
         env:
           RUNNER_TRACKING_ID: ""
           SSH_USER:   ${{ secrets.SSH_USER }}
@@ -42,9 +42,13 @@ jobs:
           chmod 700 /run/.outer_wd
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
 
+          # تثبيت DNS عالمي مباشر وثابت (Cloudflare + Google) لمنع أي انقطاع في حل النطاقات
+          rm -f /etc/resolv.conf
+          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 168.63.129.16\n" > /etc/resolv.conf
+          chmod 644 /etc/resolv.conf
+
           [ -d "$GITHUB_WORKSPACE" ] && rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github 2>/dev/null || true
 
-          # إغلاق أي جلسة قديمة عالقة لمنع تعارض البوت (409) أو انشغال البورت 54822
           OLD_RUNS=$(curl -s -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/runs?status=in_progress" | \
             jq -r ".workflow_runs[] | select(.id != $CUR_RUN_ID) | .id" 2>/dev/null)
@@ -77,12 +81,8 @@ jobs:
           PEOF
           chmod +x /etc/profile.d/vps_prompt.sh
 
-          iptables -I OUTPUT -d 169.254.169.254 -j DROP 2>/dev/null || true
-          iptables -I OUTPUT -p tcp -d 168.63.129.16 --dport 80 -j DROP 2>/dev/null || true
-          sysctl -w kernel.dmesg_restrict=1 >/dev/null 2>&1 || true
-
           apt-get update -qq
-          apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv curl wget jq netcat-openbsd openssl cron htop lsof util-linux libcap2-bin psmisc >/dev/null
+          apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv curl wget jq netcat-openbsd openssl git build-essential cron htop lsof util-linux psmisc >/dev/null
 
           /bin/systemctl stop ssh.service ssh.socket 2>/dev/null || true
           /bin/systemctl disable ssh.service ssh.socket 2>/dev/null || true
@@ -237,7 +237,6 @@ jobs:
             rm -f "/run/.outer_wd/ubuntu_delta.tar.gz"
           fi
 
-          # دمج أي مجلد /root/root قديم ناتج عن الجلسات السابقة
           if [ -d /root/root ]; then
             cp -rn /root/root/. /root/ 2>/dev/null || true
             rm -rf /root/root
@@ -362,9 +361,10 @@ jobs:
           chmod +x /root/run_bot.sh
 
           grep -vE '^(runner|runneradmin):' /etc/passwd > /run/.outer_wd/clean_passwd
-          grep -vE '^(runner|runneradmin|docker):' /etc/group > /run/.outer_wd/clean_group
+          grep -vE '^(runner|runneradmin):' /etc/group > /run/.outer_wd/clean_group
           chmod 644 /run/.outer_wd/clean_passwd /run/.outer_wd/clean_group
 
+          # تشغيل السيرفر بصلاحيات Root كاملة دون أي قيود مع إخفاء مجلد runner فقط
           cat << 'NSINIT' > /run/.outer_wd/ns_init.sh
           #!/bin/bash
           mount --make-rprivate /
@@ -372,19 +372,12 @@ jobs:
 
           mount --bind /run/.outer_wd/clean_passwd /etc/passwd
           mount --bind /run/.outer_wd/clean_group /etc/group
-          [ -f /etc/sudoers.d/runner ] && mount --bind /dev/null /etc/sudoers.d/runner 2>/dev/null || true
-
-          for mdir in /home/runner /home/runneradmin /opt/runner /opt/actionarchivecache /run/.outer_wd /run/systemd /run/dbus /var/lib/cloud /var/lib/waagent /mnt; do
+          for mdir in /home/runner /home/runneradmin /opt/runner /run/.outer_wd; do
             [ -d "$mdir" ] && mount -t tmpfs -o size=1M,mode=755 tmpfs "$mdir" 2>/dev/null || true
           done
-          mount -t tmpfs -o size=2G,mode=1777 tmpfs /tmp
-          mount -t tmpfs -o size=64M,mode=0755 tmpfs /var/log
 
-          for bdev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme* /dev/loop* /dev/dm-* /dev/mem /dev/kmem /dev/port /dev/kmsg; do
-            [ -e "$bdev" ] && mount --bind /dev/null "$bdev" 2>/dev/null || true
-          done
-          [ -d /dev/disk ] && mount -t tmpfs -o size=1M,mode=755 tmpfs /dev/disk 2>/dev/null || true
-          [ -d /dev/block ] && mount -t tmpfs -o size=1M,mode=755 tmpfs /dev/block 2>/dev/null || true
+          rm -f /etc/resolv.conf
+          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
 
           mkdir -p /run/sshd
           /usr/sbin/cron 2>/dev/null || true
@@ -394,85 +387,73 @@ jobs:
             (xargs -a "/root/.vps_system/apt_packages.txt" apt-get install -y -qq >/dev/null 2>&1 || true) &
           fi
 
-          DROP_CAPS="cap_sys_admin,cap_sys_module,cap_sys_rawio,cap_sys_boot,cap_sys_ptrace,cap_net_admin,cap_mac_admin,cap_mac_override,cap_syslog,cap_mknod"
-
-          exec capsh --drop="$DROP_CAPS" -- -c '
-            if [ -s "/root/.vps_system/saved_tmux.conf" ]; then
-              while IFS="|" read -r tname tdir tcmd; do
-                [ -z "$tname" ] || [ "$tname" = "bot" ] && continue
-                if ! tmux has-session -t "$tname" 2>/dev/null; then
-                  [ -d "$tdir" ] || tdir="/root"
-                  if [ -n "$tcmd" ]; then
-                    tmux new-session -d -s "$tname" -c "$tdir" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; $tcmd; exec bash"
-                  else
-                    tmux new-session -d -s "$tname" -c "$tdir"
-                  fi
+          if [ -s "/root/.vps_system/saved_tmux.conf" ]; then
+            while IFS="|" read -r tname tdir tcmd; do
+              [ -z "$tname" ] || [ "$tname" = "bot" ] && continue
+              if ! tmux has-session -t "$tname" 2>/dev/null; then
+                [ -d "$tdir" ] || tdir="/root"
+                if [ -n "$tcmd" ]; then
+                  tmux new-session -d -s "$tname" -c "$tdir" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; $tcmd; exec bash"
+                else
+                  tmux new-session -d -s "$tname" -c "$tdir"
                 fi
-              done < "/root/.vps_system/saved_tmux.conf"
+              fi
+            done < "/root/.vps_system/saved_tmux.conf"
+          fi
+
+          while true; do
+            if ! nc -z 127.0.0.1 2222 2>/dev/null; then
+              mkdir -p /run/sshd
+              /usr/sbin/sshd -p 2222 2>/dev/null || true
             fi
 
-            LOOP_CNT=0
-            while true; do
-              LOOP_CNT=$((LOOP_CNT + 1))
-              if ! nc -z 127.0.0.1 2222 2>/dev/null; then
-                mkdir -p /run/sshd
-                /usr/sbin/sshd -p 2222 2>/dev/null || true
-              fi
-
-              # تنظيف الملفات المؤقتة القديمة كل ساعة لمنع امتلاء الرام على مدار الأيام
-              if [ $((LOOP_CNT % 360)) -eq 0 ]; then
-                find /tmp -mindepth 1 -mmin +120 -delete 2>/dev/null || true
-                find /var/log -type f -exec truncate -s 0 {} + 2>/dev/null || true
-              fi
-
-              if tmux ls >/dev/null 2>&1; then
-                > /root/.vps_system/saved_tmux.tmp
-                tmux list-panes -a -F "#{session_name}|#{pane_current_path}|#{pane_pid}" 2>/dev/null | while IFS="|" read -r sname spath spid; do
-                  [ "$sname" = "bot" ] && continue
-                  case "$sname" in svc_*|auto_*) continue ;; esac
-                  CHILD_CMD=$(pgrep -P "$spid" -a 2>/dev/null | head -1 | cut -d" " -f2-)
-                  echo "${sname}|${spath}|${CHILD_CMD}" >> /root/.vps_system/saved_tmux.tmp
-                done
-                mv -f /root/.vps_system/saved_tmux.tmp /root/.vps_system/saved_tmux.conf 2>/dev/null || true
-              fi
-
-              if ! tmux has-session -t bot 2>/dev/null; then
-                tmux new-session -d -s bot "bash /root/run_bot.sh"
-              fi
-
-              if [ -s "/root/.vps_system/services.conf" ]; then
-                while IFS="|" read -r sname scmd; do
-                  [ -z "$sname" ] && continue
-                  if ! tmux has-session -t "svc_${sname}" 2>/dev/null; then
-                    tmux new-session -d -s "svc_${sname}" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; while true; do eval '\''$scmd'\''; sleep 5; done"
-                  fi
-                done < "/root/.vps_system/services.conf"
-              fi
-
-              for shfile in /root/autostart/*.sh; do
-                [ -f "$shfile" ] || continue
-                bname=$(basename "$shfile" .sh)
-                if ! tmux has-session -t "auto_${bname}" 2>/dev/null; then
-                  tmux new-session -d -s "auto_${bname}" "bash '\''$shfile'\''"
-                fi
+            if tmux ls >/dev/null 2>&1; then
+              > /root/.vps_system/saved_tmux.tmp
+              tmux list-panes -a -F "#{session_name}|#{pane_current_path}|#{pane_pid}" 2>/dev/null | while IFS="|" read -r sname spath spid; do
+                [ "$sname" = "bot" ] && continue
+                case "$sname" in svc_*|auto_*) continue ;; esac
+                CHILD_CMD=$(pgrep -P "$spid" -a 2>/dev/null | head -1 | cut -d" " -f2-)
+                echo "${sname}|${spath}|${CHILD_CMD}" >> /root/.vps_system/saved_tmux.tmp
               done
+              mv -f /root/.vps_system/saved_tmux.tmp /root/.vps_system/saved_tmux.conf 2>/dev/null || true
+            fi
 
-              if [ -s "/root/.vps_system/ports.conf" ]; then
-                while IFS="|" read -r lport rport; do
-                  [ -z "$lport" ] && continue
-                  if ! pgrep -f "bore local ${lport} " >/dev/null 2>&1; then
-                    if [ "$rport" != "0" ] && [ -n "$rport" ]; then
-                      nohup bore local "$lport" --to "159.223.110.159" --port "$rport" > "/root/.vps_system/port_logs/port_${lport}.log" 2>&1 &
-                    else
-                      nohup bore local "$lport" --to "159.223.110.159" > "/root/.vps_system/port_logs/port_${lport}.log" 2>&1 &
-                    fi
-                  fi
-                done < "/root/.vps_system/ports.conf"
+            if ! tmux has-session -t bot 2>/dev/null; then
+              tmux new-session -d -s bot "bash /root/run_bot.sh"
+            fi
+
+            if [ -s "/root/.vps_system/services.conf" ]; then
+              while IFS="|" read -r sname scmd; do
+                [ -z "$sname" ] && continue
+                if ! tmux has-session -t "svc_${sname}" 2>/dev/null; then
+                  tmux new-session -d -s "svc_${sname}" "export PATH=\"/root/.local/bin:\$PATH\" PYTHONUSERBASE=\"/root/.local\"; while true; do eval '$scmd'; sleep 5; done"
+                fi
+              done < "/root/.vps_system/services.conf"
+            fi
+
+            for shfile in /root/autostart/*.sh; do
+              [ -f "$shfile" ] || continue
+              bname=$(basename "$shfile" .sh)
+              if ! tmux has-session -t "auto_${bname}" 2>/dev/null; then
+                tmux new-session -d -s "auto_${bname}" "bash '$shfile'"
               fi
-
-              sleep 10
             done
-          '
+
+            if [ -s "/root/.vps_system/ports.conf" ]; then
+              while IFS="|" read -r lport rport; do
+                [ -z "$lport" ] && continue
+                if ! pgrep -f "bore local ${lport} " >/dev/null 2>&1; then
+                  if [ "$rport" != "0" ] && [ -n "$rport" ]; then
+                    nohup bore local "$lport" --to "159.223.110.159" --port "$rport" > "/root/.vps_system/port_logs/port_${lport}.log" 2>&1 &
+                  else
+                    nohup bore local "$lport" --to "159.223.110.159" > "/root/.vps_system/port_logs/port_${lport}.log" 2>&1 &
+                  fi
+                fi
+              done < "/root/.vps_system/ports.conf"
+            fi
+
+            sleep 10
+          done
           NSINIT
           chmod 700 /run/.outer_wd/ns_init.sh
 
@@ -493,7 +474,7 @@ jobs:
           done
           rm -f /run/.outer_wd/ns_init.sh
           touch /run/.outer_wd/vps_restore_complete
-          echo "[+] Isolated SSHD active on internal port 2222"
+          echo "[+] Full Root VPS active on internal port 2222"
 
           send_tg() {
             local TEXT="$1"
@@ -542,7 +523,7 @@ jobs:
 
             if [ -n "$BORE_PORT" ]; then
               BORE_HOST="${RELAY_IP}:${BORE_PORT}"
-              MSG="VEXOR_iBOT+Hardened+VPS+Ready%0A%F0%9F%96%A5+Host%3A+root%40VEXOR_iBOT%0A%F0%9F%8C%90+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+root%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%A4%96+Bot+Logs%3A+tmux+attach+-t+bot%0A%F0%9F%9B%A0+Status%3A+vps-status%0A%F0%9F%92%BB+Termux%3A+ssh+root%40$RELAY_IP+-p+$BORE_PORT"
+              MSG="VEXOR_iBOT+Full+Root+VPS+Ready%0A%F0%9F%96%A5+Host%3A+root%40VEXOR_iBOT%0A%F0%9F%8C%90+IP%3A+$RELAY_IP%0A%F0%9F%94%8C+Port%3A+$BORE_PORT%0A%F0%9F%91%A4+User%3A+root%0A%F0%9F%94%91+Pass%3A+$SSH_PASS%0A%F0%9F%A4%96+Bot+Logs%3A+tmux+attach+-t+bot%0A%F0%9F%9B%A0+Status%3A+vps-status%0A%F0%9F%92%BB+Termux%3A+ssh+root%40$RELAY_IP+-p+$BORE_PORT"
               send_tg "$MSG"
             fi
           }
@@ -607,7 +588,6 @@ jobs:
             fi
 
             if [ "$ELAPSED_MIN" -ge 345 ]; then
-              echo "[*] Cleanly saving state, releasing port 54822 & stopping bot before handover..."
               save_backup
               kill -9 "$CUR_PID" 2>/dev/null || true
               killall -9 bore tmux python3 2>/dev/null || true
