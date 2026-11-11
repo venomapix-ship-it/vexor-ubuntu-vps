@@ -1,0 +1,33 @@
+name: VEXOR Watchdog
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check_vps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Ensure VEXOR Ubuntu VPS is Running
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_REPO:  ${{ github.repository }}
+        run: |
+          ACTIVE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/runs?per_page=5" | \
+            jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting")] | length')
+          echo "[*] Active VPS runs: ${ACTIVE:-0}"
+          if [ "${ACTIVE:-0}" -eq 0 ]; then
+            echo "[!] No active VPS session found! Triggering new session..."
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"auto_restart":"true"}}'
+          else
+            echo "[+] VPS is already running normally."
+          fi

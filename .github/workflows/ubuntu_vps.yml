@@ -27,6 +27,7 @@ jobs:
           GH_TOKEN:   ${{ secrets.GH_PAT }}
           GH_REPO:    ${{ github.repository }}
           GH_REF:     ${{ github.ref_name }}
+          CUR_RUN_ID: ${{ github.run_id }}
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHATS:   ${{ secrets.TG_CHATS }}
           RELAY_IP:   "159.223.110.159"
@@ -42,6 +43,15 @@ jobs:
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
 
           [ -d "$GITHUB_WORKSPACE" ] && rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github 2>/dev/null || true
+
+          # إغلاق أي جلسة قديمة عالقة لمنع تعارض البوت (409) أو انشغال البورت 54822
+          OLD_RUNS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/runs?status=in_progress" | \
+            jq -r ".workflow_runs[] | select(.id != $CUR_RUN_ID) | .id" 2>/dev/null)
+          for orun in $OLD_RUNS; do
+            curl -s -X POST -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$GH_REPO/actions/runs/$orun/cancel" >/dev/null 2>&1 || true
+          done
 
           if ! gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1; then
             curl -sL -H "Authorization: token $GH_TOKEN" \
@@ -210,7 +220,6 @@ jobs:
 
           chmod +x /usr/local/bin/vps-apt /usr/local/bin/add-bot /usr/local/bin/open-port /usr/local/bin/close-port /usr/local/bin/vps-status /usr/local/bin/vps-backup
 
-          # استرجاع النسخة الاحتياطية حصرياً داخل /root مع حماية صلاحية / (755)
           BOT_DIR="/root/bot"
           SYS_DIR="/root/.vps_system"
           mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/port_logs" "/root/autostart"
@@ -228,11 +237,15 @@ jobs:
             rm -f "/run/.outer_wd/ubuntu_delta.tar.gz"
           fi
 
-          # تأكيد صلاحية 755 على الجذر / حتى لا يُحجب مستخدم runner أبداً
+          # دمج أي مجلد /root/root قديم ناتج عن الجلسات السابقة
+          if [ -d /root/root ]; then
+            cp -rn /root/root/. /root/ 2>/dev/null || true
+            rm -rf /root/root
+          fi
+
           chmod 755 / /root /home /home/runner 2>/dev/null || true
           rm -rf /root/.config/gh /root/.gitconfig /root/.git-credentials 2>/dev/null || true
 
-          # تنظيف ملف apt_packages.txt إذا كان متضخماً من الجلسات القديمة (> 25 سطر)
           if [ -f "$SYS_DIR/apt_packages.txt" ] && [ "$(wc -l < "$SYS_DIR/apt_packages.txt")" -gt 25 ]; then
             rm -f "$SYS_DIR/apt_packages.txt"
           fi
@@ -377,7 +390,6 @@ jobs:
           /usr/sbin/cron 2>/dev/null || true
           /usr/sbin/sshd -p 2222
 
-          # تثبيت حزم vps-apt الإضافية في الخلفية دون تأخير تشغيل السيرفر
           if [ -s "/root/.vps_system/apt_packages.txt" ]; then
             (xargs -a "/root/.vps_system/apt_packages.txt" apt-get install -y -qq >/dev/null 2>&1 || true) &
           fi
@@ -399,10 +411,18 @@ jobs:
               done < "/root/.vps_system/saved_tmux.conf"
             fi
 
+            LOOP_CNT=0
             while true; do
+              LOOP_CNT=$((LOOP_CNT + 1))
               if ! nc -z 127.0.0.1 2222 2>/dev/null; then
                 mkdir -p /run/sshd
                 /usr/sbin/sshd -p 2222 2>/dev/null || true
+              fi
+
+              # تنظيف الملفات المؤقتة القديمة كل ساعة لمنع امتلاء الرام على مدار الأيام
+              if [ $((LOOP_CNT % 360)) -eq 0 ]; then
+                find /tmp -mindepth 1 -mmin +120 -delete 2>/dev/null || true
+                find /var/log -type f -exec truncate -s 0 {} + 2>/dev/null || true
               fi
 
               if tmux ls >/dev/null 2>&1; then
@@ -587,9 +607,11 @@ jobs:
             fi
 
             if [ "$ELAPSED_MIN" -ge 345 ]; then
-              echo "[*] Saving state & triggering next session before exit..."
+              echo "[*] Cleanly saving state, releasing port 54822 & stopping bot before handover..."
               save_backup
               kill -9 "$CUR_PID" 2>/dev/null || true
+              killall -9 bore tmux python3 2>/dev/null || true
+              sleep 3
               for retry in 1 2 3 4 5; do
                 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
                   -H "Authorization: token $GH_TOKEN" \
