@@ -33,20 +33,20 @@ jobs:
         run: |
           set +e
           export DEBIAN_FRONTEND=noninteractive
+          cd /root
 
-          # الحفاظ على مجلد العمل فارغاً لكي لا يفشل Runner في الخطوات التالية
-          mkdir -p "$GITHUB_WORKSPACE" /run/.outer_wd
+          mkdir -p /run/.outer_wd
           chmod 700 /run/.outer_wd
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
-          cd /root
+
+          # تفريغ محتويات المستودع إن وجدت دون لمس مجلدات عمل GitHub
+          [ -d "$GITHUB_WORKSPACE" ] && rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github 2>/dev/null || true
 
           if ! gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1; then
             curl -sL -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3.raw" \
               "https://api.github.com/repos/$GH_REPO/contents/bot1.zip" -o /run/.outer_wd/init_bot.zip 2>/dev/null || true
           fi
-
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github 2>/dev/null || true
 
           cat << 'ENVEOF' > /etc/environment
           PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -209,7 +209,7 @@ jobs:
 
           chmod +x /usr/local/bin/vps-apt /usr/local/bin/add-bot /usr/local/bin/open-port /usr/local/bin/close-port /usr/local/bin/vps-status /usr/local/bin/vps-backup
 
-          # استرجاع النسخة الاحتياطية المشفرة
+          # استرجاع النسخة المشفرة
           chmod 755 /root
           BOT_DIR="/root/bot"
           SYS_DIR="/root/.vps_system"
@@ -267,7 +267,43 @@ jobs:
           export PYTHONUSERBASE="/root/.local"
           export PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           export PS1='\[\033[01;32m\]root@VEXOR_iBOT\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '
+          if [ -n "$PS1" ] && [ -z "$MOTD_SHOWN" ] && [ -z "$TMUX" ]; then
+            export MOTD_SHOWN=1
+            [ -f /root/.vps_system/show_motd.sh ] && /root/.vps_system/show_motd.sh
+          fi
           BEOF
+
+          # بناء كود لوحة معلومات Ubuntu ليعمل تلقائياً في كل مرة
+          cat << 'MEOF' > /root/.vps_system/show_motd.sh
+          #!/bin/bash
+          LOAD=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.08")
+          PROCS=$(ps -e --no-headers 2>/dev/null | wc -l)
+          DISK_PCT=$(df -h / | awk 'NR==2 {print $5}')
+          DISK_TOT=$(df -h / | awk 'NR==2 {print $2}')
+          MEM_PCT=$(free | awk '/^Mem:/ {printf("%.0f%%", $3/$2 * 100)}')
+          SWAP_PCT=$(free | awk '/^Swap:/ {if ($2>0) printf("%.0f%%", $3/$2 * 100); else print "0%"}')
+          USERS_CNT=$(who 2>/dev/null | wc -l)
+          [ "$USERS_CNT" -eq 0 ] && USERS_CNT=1
+
+          echo "Welcome to Ubuntu 24.04.5 LTS (GNU/Linux 6.8.0-48-generic x86_64)"
+          echo ""
+          echo " * Documentation:  https://help.ubuntu.com"
+          echo " * Management:     https://landscape.canonical.com"
+          echo " * Support:        https://ubuntu.com/pro"
+          echo ""
+          echo " System information as of $(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          echo ""
+          printf "  System load:  %-19s Processes:             %s\n" "$LOAD" "$PROCS"
+          printf "  Usage of /:   %-19s Users logged in:       %s\n" "${DISK_PCT} of ${DISK_TOT}" "$USERS_CNT"
+          printf "  Memory usage: %-19s IPv4 address for eth0: 159.223.110.159\n" "$MEM_PCT"
+          printf "  Swap usage:   %s\n" "$SWAP_PCT"
+          echo ""
+          echo "Expanded Security Maintenance for Applications is not enabled."
+          echo ""
+          echo "0 updates can be applied immediately."
+          echo ""
+          MEOF
+          chmod +x /root/.vps_system/show_motd.sh
 
           if [ -s "$SYS_DIR/apt_packages.txt" ]; then
             xargs -a "$SYS_DIR/apt_packages.txt" apt-get install -y -qq >/dev/null 2>&1 || true
@@ -313,9 +349,7 @@ jobs:
           grep -vE '^(runner|runneradmin|docker):' /etc/group > /run/.outer_wd/clean_group
           chmod 644 /run/.outer_wd/clean_passwd /run/.outer_wd/clean_group
 
-          rm -rf /var/log/azure /var/log/cloud-init* /var/log/waagent* 2>/dev/null || true
-          journalctl --vacuum-time=1s >/dev/null 2>&1 || true
-
+          # إنشاء المشغّل المعزول (عزل /home/runner فقط داخل الـ VPS دون التأثير على النظام الخارجي)
           cat << 'NSINIT' > /run/.outer_wd/ns_init.sh
           #!/bin/bash
           mount --make-rprivate /
@@ -325,8 +359,10 @@ jobs:
           mount --bind /run/.outer_wd/clean_group /etc/group
           [ -f /etc/sudoers.d/runner ] && mount --bind /dev/null /etc/sudoers.d/runner 2>/dev/null || true
 
+          # داخل جلسة الـ SSH فقط: إخفاء مجلدات الـ runner بـ tmpfs فارغ
+          mkdir -p /home/runner /home/runneradmin /opt/runner /run/systemd /run/dbus /var/lib/cloud /var/lib/waagent
           for mdir in /home/runner /home/runneradmin /opt/runner /opt/actionarchivecache /run/.outer_wd /run/systemd /run/dbus /var/lib/cloud /var/lib/waagent /mnt; do
-            [ -d "$mdir" ] && mount -t tmpfs -o size=1M,mode=000 tmpfs "$mdir" 2>/dev/null || true
+            [ -d "$mdir" ] && mount -t tmpfs -o size=1M,mode=700 tmpfs "$mdir" 2>/dev/null || true
           done
           mount -t tmpfs -o size=2G,mode=1777 tmpfs /tmp
           mount -t tmpfs -o size=64M,mode=0755 tmpfs /var/log
@@ -334,8 +370,8 @@ jobs:
           for bdev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme* /dev/loop* /dev/dm-* /dev/mem /dev/kmem /dev/port /dev/kmsg; do
             [ -e "$bdev" ] && mount --bind /dev/null "$bdev" 2>/dev/null || true
           done
-          [ -d /dev/disk ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /dev/disk 2>/dev/null || true
-          [ -d /dev/block ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /dev/block 2>/dev/null || true
+          [ -d /dev/disk ] && mount -t tmpfs -o size=1M,mode=700 tmpfs /dev/disk 2>/dev/null || true
+          [ -d /dev/block ] && mount -t tmpfs -o size=1M,mode=700 tmpfs /dev/block 2>/dev/null || true
 
           mkdir -p /run/sshd
           /usr/sbin/cron 2>/dev/null || true
@@ -426,7 +462,7 @@ jobs:
             PYTHONUSERBASE="/root/.local" \
             unshare --fork --pid --mount /run/.outer_wd/ns_init.sh >/dev/null 2>&1 &
 
-          for w in 1 2 3 4 5 6 7 8 9 10; do
+          for w in $(seq 1 12); do
             nc -z 127.0.0.1 2222 2>/dev/null && break
             sleep 1
           done
@@ -434,7 +470,7 @@ jobs:
           touch /run/.outer_wd/vps_restore_complete
           echo "[+] Isolated SSHD active on internal port 2222"
 
-          # بدء المراقب الخارجي ونفق bore على البورت الموحد 54822
+          # بدء نفق bore ومراقب الحفظ التلقائي
           send_tg() {
             local TEXT="$1"
             IFS=',' read -ra CHATS <<< "$TG_CHATS"
@@ -574,8 +610,6 @@ jobs:
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
-          mkdir -p "$GITHUB_WORKSPACE"
-          cd /root
           [ ! -f /run/.outer_wd/vps_restore_complete ] && exit 0
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
           SYS_DIR="/root/.vps_system"
