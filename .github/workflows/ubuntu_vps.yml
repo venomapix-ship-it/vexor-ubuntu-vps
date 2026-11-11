@@ -19,30 +19,33 @@ jobs:
         shell: sudo -E bash {0}
 
     steps:
-      - name: Setup Zero-Checkout Kernel-Isolated VPS
+      - name: Setup, Restore, Lock Namespace & Start Tunnel
         env:
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PASS: ${{ secrets.SSH_PASS }}
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_REPO:  ${{ github.repository }}
-          RELAY_IP: "159.223.110.159"
+          RUNNER_TRACKING_ID: ""
+          SSH_USER:   ${{ secrets.SSH_USER }}
+          SSH_PASS:   ${{ secrets.SSH_PASS }}
+          GH_TOKEN:   ${{ secrets.GH_PAT }}
+          GH_REPO:    ${{ github.repository }}
+          TG_TOKEN:   ${{ secrets.TG_TOKEN }}
+          TG_CHATS:   ${{ secrets.TG_CHATS }}
+          RELAY_IP:   "159.223.110.159"
+          FIXED_PORT: "54822"
         run: |
           set +e
-          cd /root
           export DEBIAN_FRONTEND=noninteractive
 
-          mkdir -p /run/.outer_wd
+          # الحفاظ على مجلد العمل فارغاً لكي لا يفشل Runner في الخطوات التالية
+          mkdir -p "$GITHUB_WORKSPACE" /run/.outer_wd
           chmod 700 /run/.outer_wd
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
+          cd /root
 
-          # سحب bot1.zip عبر الـ API فقط في أول مرة دون عمل git clone للمستودع
           if ! gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1; then
             curl -sL -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3.raw" \
               "https://api.github.com/repos/$GH_REPO/contents/bot1.zip" -o /run/.outer_wd/init_bot.zip 2>/dev/null || true
           fi
 
-          # تفريغ محتويات مجلد العمل دون حذف المجلد نفسه لتجنب خطأ المسار
           rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github 2>/dev/null || true
 
           cat << 'ENVEOF' > /etc/environment
@@ -63,7 +66,6 @@ jobs:
           PEOF
           chmod +x /etc/profile.d/vps_prompt.sh
 
-          # حجب بورت HTTP (80) فقط لـ Metadata مع ترك DNS (بورت 53) شغالاً 100%
           iptables -I OUTPUT -d 169.254.169.254 -j DROP 2>/dev/null || true
           iptables -I OUTPUT -p tcp -d 168.63.129.16 --dport 80 -j DROP 2>/dev/null || true
           sysctl -w kernel.dmesg_restrict=1 >/dev/null 2>&1 || true
@@ -71,7 +73,6 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv python3-full curl wget jq netcat-openbsd openssl git build-essential cron htop lsof util-linux libcap2-bin psmisc >/dev/null
 
-          # إيقاف SSH الخارجي تماماً حتى يعمل فقط SSH الداخلي المعزول على بورت 2222
           /bin/systemctl stop ssh.service ssh.socket 2>/dev/null || true
           /bin/systemctl disable ssh.service ssh.socket 2>/dev/null || true
           pkill -9 sshd 2>/dev/null || true
@@ -208,23 +209,12 @@ jobs:
 
           chmod +x /usr/local/bin/vps-apt /usr/local/bin/add-bot /usr/local/bin/open-port /usr/local/bin/close-port /usr/local/bin/vps-status /usr/local/bin/vps-backup
 
-      - name: Restore Full State & Launch Locked Namespace on Port 2222
-        env:
-          RUNNER_TRACKING_ID: ""
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_REPO:  ${{ github.repository }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PASS: ${{ secrets.SSH_PASS }}
-        run: |
-          set +e
-          cd /root
-          export DEBIAN_FRONTEND=noninteractive
+          # استرجاع النسخة الاحتياطية المشفرة
           chmod 755 /root
           BOT_DIR="/root/bot"
           SYS_DIR="/root/.vps_system"
           mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/port_logs" "/root/autostart"
 
-          export GH_CONFIG_DIR="/run/.outer_wd/gh"
           if gh release download "delta-backup" -p "ubuntu_delta.tar.gz.enc" -O "/run/.outer_wd/ubuntu_delta.tar.gz.enc" --repo "$GH_REPO" 2>/dev/null; then
             openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in "/run/.outer_wd/ubuntu_delta.tar.gz.enc" -out "/run/.outer_wd/ubuntu_delta.tar.gz"
             tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/" 2>/dev/null || tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
@@ -323,7 +313,7 @@ jobs:
           grep -vE '^(runner|runneradmin|docker):' /etc/group > /run/.outer_wd/clean_group
           chmod 644 /run/.outer_wd/clean_passwd /run/.outer_wd/clean_group
 
-          rm -rf /var/log/azure /var/log/cloud-init* /var/log/waagent* /etc/sudoers.d/runner 2>/dev/null || true
+          rm -rf /var/log/azure /var/log/cloud-init* /var/log/waagent* 2>/dev/null || true
           journalctl --vacuum-time=1s >/dev/null 2>&1 || true
 
           cat << 'NSINIT' > /run/.outer_wd/ns_init.sh
@@ -333,6 +323,7 @@ jobs:
 
           mount --bind /run/.outer_wd/clean_passwd /etc/passwd
           mount --bind /run/.outer_wd/clean_group /etc/group
+          [ -f /etc/sudoers.d/runner ] && mount --bind /dev/null /etc/sudoers.d/runner 2>/dev/null || true
 
           for mdir in /home/runner /home/runneradmin /opt/runner /opt/actionarchivecache /run/.outer_wd /run/systemd /run/dbus /var/lib/cloud /var/lib/waagent /mnt; do
             [ -d "$mdir" ] && mount -t tmpfs -o size=1M,mode=000 tmpfs "$mdir" 2>/dev/null || true
@@ -340,31 +331,19 @@ jobs:
           mount -t tmpfs -o size=2G,mode=1777 tmpfs /tmp
           mount -t tmpfs -o size=64M,mode=0755 tmpfs /var/log
 
-          mkdir -p /tmp/.clean_dev
-          mount -t tmpfs -o size=16M,mode=0755 tmpfs /tmp/.clean_dev
-          for devnode in null zero full random urandom tty fuse; do
-            if [ -e "/dev/$devnode" ]; then
-              touch "/tmp/.clean_dev/$devnode"
-              mount --bind "/dev/$devnode" "/tmp/.clean_dev/$devnode"
-            fi
+          for bdev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme* /dev/loop* /dev/dm-* /dev/mem /dev/kmem /dev/port /dev/kmsg; do
+            [ -e "$bdev" ] && mount --bind /dev/null "$bdev" 2>/dev/null || true
           done
-          mkdir -p /tmp/.clean_dev/pts /tmp/.clean_dev/shm /tmp/.clean_dev/net
-          mount -t devpts -o rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=0666 devpts /tmp/.clean_dev/pts
-          mount -t tmpfs -o rw,nosuid,nodev tmpfs /tmp/.clean_dev/shm
-          ln -s /proc/self/fd /tmp/.clean_dev/fd
-          ln -s /proc/self/fd/0 /tmp/.clean_dev/stdin
-          ln -s /proc/self/fd/1 /tmp/.clean_dev/stdout
-          ln -s /proc/self/fd/2 /tmp/.clean_dev/stderr
-          ln -s pts/ptmx /tmp/.clean_dev/ptmx
-          mount --move /tmp/.clean_dev /dev
+          [ -d /dev/disk ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /dev/disk 2>/dev/null || true
+          [ -d /dev/block ] && mount -t tmpfs -o size=1M,mode=000 tmpfs /dev/block 2>/dev/null || true
 
-          DROP_CAPS="cap_sys_admin,cap_sys_module,cap_sys_rawio,cap_sys_boot,cap_sys_ptrace,cap_net_admin,cap_mac_admin,cap_mac_override,cap_syslog,cap_mknod,cap_audit_control"
+          mkdir -p /run/sshd
+          /usr/sbin/cron 2>/dev/null || true
+          /usr/sbin/sshd -p 2222
+
+          DROP_CAPS="cap_sys_admin,cap_sys_module,cap_sys_rawio,cap_sys_boot,cap_sys_ptrace,cap_net_admin,cap_mac_admin,cap_mac_override,cap_syslog,cap_mknod"
 
           exec capsh --drop="$DROP_CAPS" -- -c '
-            mkdir -p /run/sshd
-            /usr/sbin/cron 2>/dev/null || true
-            /usr/sbin/sshd -p 2222
-
             if [ -s "/root/.vps_system/saved_tmux.conf" ]; then
               while IFS="|" read -r tname tdir tcmd; do
                 [ -z "$tname" ] || [ "$tname" = "bot" ] && continue
@@ -380,6 +359,11 @@ jobs:
             fi
 
             while true; do
+              if ! nc -z 127.0.0.1 2222 2>/dev/null; then
+                mkdir -p /run/sshd
+                /usr/sbin/sshd -p 2222 2>/dev/null || true
+              fi
+
               if tmux ls >/dev/null 2>&1; then
                 > /root/.vps_system/saved_tmux.tmp
                 tmux list-panes -a -F "#{session_name}|#{pane_current_path}|#{pane_pid}" 2>/dev/null | while IFS="|" read -r sname spath spid; do
@@ -442,27 +426,15 @@ jobs:
             PYTHONUSERBASE="/root/.local" \
             unshare --fork --pid --mount /run/.outer_wd/ns_init.sh >/dev/null 2>&1 &
 
-          sleep 3
+          for w in 1 2 3 4 5 6 7 8 9 10; do
+            nc -z 127.0.0.1 2222 2>/dev/null && break
+            sleep 1
+          done
           rm -f /run/.outer_wd/ns_init.sh
           touch /run/.outer_wd/vps_restore_complete
-          echo "[+] Hardened VPS namespace active on internal port 2222"
+          echo "[+] Isolated SSHD active on internal port 2222"
 
-      - name: Outer Stealth Watchdog & Unified Port 54822 Manager
-        env:
-          RUNNER_TRACKING_ID: ""
-          GH_TOKEN:   ${{ secrets.GH_PAT }}
-          GH_REPO:    ${{ github.repository }}
-          TG_TOKEN:   ${{ secrets.TG_TOKEN }}
-          TG_CHATS:   ${{ secrets.TG_CHATS }}
-          SSH_PASS:   ${{ secrets.SSH_PASS }}
-          RELAY_IP:   "159.223.110.159"
-          FIXED_PORT: "54822"
-        run: |
-          set +e
-          cd /root
-          SYS_DIR="/root/.vps_system"
-          export GH_CONFIG_DIR="/run/.outer_wd/gh"
-
+          # بدء المراقب الخارجي ونفق bore على البورت الموحد 54822
           send_tg() {
             local TEXT="$1"
             IFS=',' read -ra CHATS <<< "$TG_CHATS"
@@ -602,6 +574,7 @@ jobs:
           SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
+          mkdir -p "$GITHUB_WORKSPACE"
           cd /root
           [ ! -f /run/.outer_wd/vps_restore_complete ] && exit 0
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
