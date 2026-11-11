@@ -19,13 +19,14 @@ jobs:
         shell: sudo -E bash {0}
 
     steps:
-      - name: Setup, Restore, Lock Namespace & Start Tunnel
+      - name: Fast Boot Hardened VPS, Restore & Watchdog
         env:
           RUNNER_TRACKING_ID: ""
           SSH_USER:   ${{ secrets.SSH_USER }}
           SSH_PASS:   ${{ secrets.SSH_PASS }}
           GH_TOKEN:   ${{ secrets.GH_PAT }}
           GH_REPO:    ${{ github.repository }}
+          GH_REF:     ${{ github.ref_name }}
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHATS:   ${{ secrets.TG_CHATS }}
           RELAY_IP:   "159.223.110.159"
@@ -33,13 +34,13 @@ jobs:
         run: |
           set +e
           export DEBIAN_FRONTEND=noninteractive
+          chmod 755 / /home /home/runner 2>/dev/null || true
           cd /root
 
           mkdir -p /run/.outer_wd
           chmod 700 /run/.outer_wd
           export GH_CONFIG_DIR="/run/.outer_wd/gh"
 
-          # تفريغ محتويات المستودع إن وجدت دون لمس مجلدات عمل GitHub
           [ -d "$GITHUB_WORKSPACE" ] && rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.git "$GITHUB_WORKSPACE"/.github 2>/dev/null || true
 
           if ! gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1; then
@@ -71,14 +72,14 @@ jobs:
           sysctl -w kernel.dmesg_restrict=1 >/dev/null 2>&1 || true
 
           apt-get update -qq
-          apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv python3-full curl wget jq netcat-openbsd openssl git build-essential cron htop lsof util-linux libcap2-bin psmisc >/dev/null
+          apt-get install -y -qq openssh-server unzip zip tmux screen python3-pip python3-venv curl wget jq netcat-openbsd openssl cron htop lsof util-linux libcap2-bin psmisc >/dev/null
 
           /bin/systemctl stop ssh.service ssh.socket 2>/dev/null || true
           /bin/systemctl disable ssh.service ssh.socket 2>/dev/null || true
           pkill -9 sshd 2>/dev/null || true
 
-          apt-mark showmanual | sort > /run/.outer_wd/vps_base_pkgs.txt
-          pip3 install --break-system-packages -q requests urllib3 PySocks cryptography asn1crypto
+          pip3 install -H --break-system-packages -q requests urllib3 PySocks cryptography asn1crypto 2>/dev/null || \
+            pip3 install --break-system-packages -q requests urllib3 PySocks cryptography asn1crypto
 
           echo "root:$SSH_PASS" | chpasswd
           if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
@@ -209,21 +210,32 @@ jobs:
 
           chmod +x /usr/local/bin/vps-apt /usr/local/bin/add-bot /usr/local/bin/open-port /usr/local/bin/close-port /usr/local/bin/vps-status /usr/local/bin/vps-backup
 
-          # استرجاع النسخة المشفرة
-          chmod 755 /root
+          # استرجاع النسخة الاحتياطية حصرياً داخل /root مع حماية صلاحية / (755)
           BOT_DIR="/root/bot"
           SYS_DIR="/root/.vps_system"
           mkdir -p "$BOT_DIR" "$SYS_DIR/ssh_keys" "$SYS_DIR/port_logs" "/root/autostart"
 
           if gh release download "delta-backup" -p "ubuntu_delta.tar.gz.enc" -O "/run/.outer_wd/ubuntu_delta.tar.gz.enc" --repo "$GH_REPO" 2>/dev/null; then
             openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in "/run/.outer_wd/ubuntu_delta.tar.gz.enc" -out "/run/.outer_wd/ubuntu_delta.tar.gz"
-            tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/" 2>/dev/null || tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
+            if tar -tzf "/run/.outer_wd/ubuntu_delta.tar.gz" 2>/dev/null | grep -q '^root/'; then
+              tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/" 2>/dev/null || true
+            else
+              tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
+            fi
             rm -f "/run/.outer_wd/ubuntu_delta.tar.gz" "/run/.outer_wd/ubuntu_delta.tar.gz.enc"
           elif gh release download "delta-backup" -p "ubuntu_delta.tar.gz" -O "/run/.outer_wd/ubuntu_delta.tar.gz" --repo "$GH_REPO" 2>/dev/null; then
             tar -xzf "/run/.outer_wd/ubuntu_delta.tar.gz" -C "/root" 2>/dev/null || true
             rm -f "/run/.outer_wd/ubuntu_delta.tar.gz"
           fi
+
+          # تأكيد صلاحية 755 على الجذر / حتى لا يُحجب مستخدم runner أبداً
+          chmod 755 / /root /home /home/runner 2>/dev/null || true
           rm -rf /root/.config/gh /root/.gitconfig /root/.git-credentials 2>/dev/null || true
+
+          # تنظيف ملف apt_packages.txt إذا كان متضخماً من الجلسات القديمة (> 25 سطر)
+          if [ -f "$SYS_DIR/apt_packages.txt" ] && [ "$(wc -l < "$SYS_DIR/apt_packages.txt")" -gt 25 ]; then
+            rm -f "$SYS_DIR/apt_packages.txt"
+          fi
 
           if [ -n "$SSH_USER" ] && [ "$SSH_USER" != "root" ]; then
             if [ -d "/home/$SSH_USER" ] && [ ! -L "/home/$SSH_USER" ]; then
@@ -259,21 +271,6 @@ jobs:
           sed -i 's/^#*AcceptEnv.*/#AcceptEnv/' /etc/ssh/sshd_config
           grep -q "ClientAliveInterval" /etc/ssh/sshd_config || echo -e "ClientAliveInterval 30\nClientAliveCountMax 10\nTCPKeepAlive yes" >> /etc/ssh/sshd_config
 
-          sed -i '/VEXOR_iBOT/d' /root/.bashrc 2>/dev/null || true
-          cat << 'BEOF' >> /root/.bashrc
-          export HOSTNAME="VEXOR_iBOT"
-          export PIP_USER=1
-          export PIP_BREAK_SYSTEM_PACKAGES=1
-          export PYTHONUSERBASE="/root/.local"
-          export PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-          export PS1='\[\033[01;32m\]root@VEXOR_iBOT\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '
-          if [ -n "$PS1" ] && [ -z "$MOTD_SHOWN" ] && [ -z "$TMUX" ]; then
-            export MOTD_SHOWN=1
-            [ -f /root/.vps_system/show_motd.sh ] && /root/.vps_system/show_motd.sh
-          fi
-          BEOF
-
-          # بناء كود لوحة معلومات Ubuntu ليعمل تلقائياً في كل مرة
           cat << 'MEOF' > /root/.vps_system/show_motd.sh
           #!/bin/bash
           LOAD=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.08")
@@ -305,19 +302,24 @@ jobs:
           MEOF
           chmod +x /root/.vps_system/show_motd.sh
 
-          if [ -s "$SYS_DIR/apt_packages.txt" ]; then
-            xargs -a "$SYS_DIR/apt_packages.txt" apt-get install -y -qq >/dev/null 2>&1 || true
+          sed -i '/VEXOR_iBOT/d' /root/.bashrc 2>/dev/null || true
+          sed -i '/show_motd.sh/d' /root/.bashrc 2>/dev/null || true
+          cat << 'BEOF' >> /root/.bashrc
+          export HOSTNAME="VEXOR_iBOT"
+          export PIP_USER=1
+          export PIP_BREAK_SYSTEM_PACKAGES=1
+          export PYTHONUSERBASE="/root/.local"
+          export PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          export PS1='\[\033[01;32m\]root@VEXOR_iBOT\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '
+          if [ -n "$PS1" ] && [ -z "$MOTD_SHOWN" ] && [ -z "$TMUX" ]; then
+            export MOTD_SHOWN=1
+            [ -f /root/.vps_system/show_motd.sh ] && /root/.vps_system/show_motd.sh
           fi
-          if [ -s "$SYS_DIR/pip_packages.txt" ]; then
-            PIP_USER=1 PYTHONUSERBASE="/root/.local" pip3 install --break-system-packages -q -r "$SYS_DIR/pip_packages.txt" 2>/dev/null || true
-          fi
+          BEOF
+
           if [ -s "$SYS_DIR/user.cron" ]; then
             crontab "$SYS_DIR/user.cron" 2>/dev/null || true
           fi
-
-          find /root -maxdepth 3 -name "requirements.txt" 2>/dev/null | while read -r req; do
-            PIP_USER=1 PYTHONUSERBASE="/root/.local" pip3 install --break-system-packages -q -r "$req" 2>/dev/null || true
-          done
 
           cat << 'BOTEOF' > /root/run_bot.sh
           #!/bin/bash
@@ -331,6 +333,7 @@ jobs:
             exit 0
           fi
           cd "$(dirname "$BOT_FILE")"
+          [ -f requirements.txt ] && pip3 install --break-system-packages -q -r requirements.txt 2>/dev/null || true
           while true; do
             echo "🤖 [$(date '+%H:%M:%S')] Starting VEXOR Bot as root@VEXOR_iBOT..."
             if [ -f .env ]; then
@@ -349,7 +352,6 @@ jobs:
           grep -vE '^(runner|runneradmin|docker):' /etc/group > /run/.outer_wd/clean_group
           chmod 644 /run/.outer_wd/clean_passwd /run/.outer_wd/clean_group
 
-          # إنشاء المشغّل المعزول (عزل /home/runner فقط داخل الـ VPS دون التأثير على النظام الخارجي)
           cat << 'NSINIT' > /run/.outer_wd/ns_init.sh
           #!/bin/bash
           mount --make-rprivate /
@@ -359,10 +361,8 @@ jobs:
           mount --bind /run/.outer_wd/clean_group /etc/group
           [ -f /etc/sudoers.d/runner ] && mount --bind /dev/null /etc/sudoers.d/runner 2>/dev/null || true
 
-          # داخل جلسة الـ SSH فقط: إخفاء مجلدات الـ runner بـ tmpfs فارغ
-          mkdir -p /home/runner /home/runneradmin /opt/runner /run/systemd /run/dbus /var/lib/cloud /var/lib/waagent
           for mdir in /home/runner /home/runneradmin /opt/runner /opt/actionarchivecache /run/.outer_wd /run/systemd /run/dbus /var/lib/cloud /var/lib/waagent /mnt; do
-            [ -d "$mdir" ] && mount -t tmpfs -o size=1M,mode=700 tmpfs "$mdir" 2>/dev/null || true
+            [ -d "$mdir" ] && mount -t tmpfs -o size=1M,mode=755 tmpfs "$mdir" 2>/dev/null || true
           done
           mount -t tmpfs -o size=2G,mode=1777 tmpfs /tmp
           mount -t tmpfs -o size=64M,mode=0755 tmpfs /var/log
@@ -370,12 +370,17 @@ jobs:
           for bdev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme* /dev/loop* /dev/dm-* /dev/mem /dev/kmem /dev/port /dev/kmsg; do
             [ -e "$bdev" ] && mount --bind /dev/null "$bdev" 2>/dev/null || true
           done
-          [ -d /dev/disk ] && mount -t tmpfs -o size=1M,mode=700 tmpfs /dev/disk 2>/dev/null || true
-          [ -d /dev/block ] && mount -t tmpfs -o size=1M,mode=700 tmpfs /dev/block 2>/dev/null || true
+          [ -d /dev/disk ] && mount -t tmpfs -o size=1M,mode=755 tmpfs /dev/disk 2>/dev/null || true
+          [ -d /dev/block ] && mount -t tmpfs -o size=1M,mode=755 tmpfs /dev/block 2>/dev/null || true
 
           mkdir -p /run/sshd
           /usr/sbin/cron 2>/dev/null || true
           /usr/sbin/sshd -p 2222
+
+          # تثبيت حزم vps-apt الإضافية في الخلفية دون تأخير تشغيل السيرفر
+          if [ -s "/root/.vps_system/apt_packages.txt" ]; then
+            (xargs -a "/root/.vps_system/apt_packages.txt" apt-get install -y -qq >/dev/null 2>&1 || true) &
+          fi
 
           DROP_CAPS="cap_sys_admin,cap_sys_module,cap_sys_rawio,cap_sys_boot,cap_sys_ptrace,cap_net_admin,cap_mac_admin,cap_mac_override,cap_syslog,cap_mknod"
 
@@ -470,7 +475,6 @@ jobs:
           touch /run/.outer_wd/vps_restore_complete
           echo "[+] Isolated SSHD active on internal port 2222"
 
-          # بدء نفق bore ومراقب الحفظ التلقائي
           send_tg() {
             local TEXT="$1"
             IFS=',' read -ra CHATS <<< "$TG_CHATS"
@@ -524,32 +528,26 @@ jobs:
           }
 
           capture_system_state() {
+            chmod 755 / /root /home /home/runner 2>/dev/null || true
             mkdir -p "$SYS_DIR/ssh_keys"
             crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
             cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
-            if [ -f /run/.outer_wd/vps_base_pkgs.txt ]; then
-              comm -13 /run/.outer_wd/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
-              [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
-            fi
-            PYTHONUSERBASE="/root/.local" pip3 list --user --format=freeze > "$SYS_DIR/pip_packages.txt" 2>/dev/null || true
           }
 
           save_backup() {
             [ ! -f /run/.outer_wd/vps_restore_complete ] && return 0
             capture_system_state
             rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
-            BACKUP_PATHS="/root"
-            [ -d /var/www ] && BACKUP_PATHS="$BACKUP_PATHS /var/www"
-            [ -d /srv ] && BACKUP_PATHS="$BACKUP_PATHS /srv"
             tar --warning=no-file-changed --ignore-failed-read \
               --exclude='.cache' --exclude='.npm' --exclude='.config/gh' --exclude='__pycache__' --exclude='*.log' \
-              -czf /run/.outer_wd/ubuntu_delta.tar.gz $BACKUP_PATHS 2>/dev/null
+              -czf /run/.outer_wd/ubuntu_delta.tar.gz -C "/root" . 2>/dev/null
             if [ -s /run/.outer_wd/ubuntu_delta.tar.gz ]; then
               chmod 644 /run/.outer_wd/ubuntu_delta.tar.gz
               openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /run/.outer_wd/ubuntu_delta.tar.gz -out /run/.outer_wd/ubuntu_delta.tar.gz.enc
               gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
                 gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated root state backup" --repo "$GH_REPO" >/dev/null 2>&1
-              gh release upload "delta-backup" "/run/.outer_wd/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
+              gh release upload "delta-backup" "/run/.outer_wd/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1 && \
+                echo "[+] Encrypted backup uploaded OK"
               gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
               rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
             fi
@@ -563,6 +561,8 @@ jobs:
             NOW_TS=$(date +%s)
             ELAPSED_MIN=$(( (NOW_TS - START_TS) / 60 ))
             SINCE_SAVE=$(( (NOW_TS - LAST_TS) / 60 ))
+
+            chmod 755 / /home /home/runner 2>/dev/null || true
 
             if [ -f "$SYS_DIR/.manual_backup_req" ]; then
               save_backup
@@ -586,9 +586,19 @@ jobs:
               LAST_TS=$(date +%s)
             fi
 
-            if [ "$ELAPSED_MIN" -ge 348 ]; then
+            if [ "$ELAPSED_MIN" -ge 345 ]; then
+              echo "[*] Saving state & triggering next session before exit..."
               save_backup
               kill -9 "$CUR_PID" 2>/dev/null || true
+              for retry in 1 2 3 4 5; do
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/dispatches" \
+                  -d "{\"ref\":\"$GH_REF\",\"inputs\":{\"auto_restart\":\"true\"}}")
+                [ "$HTTP_CODE" = "204" ] && { touch /run/.outer_wd/restarted_ok; break; }
+                sleep 5
+              done
               break
             fi
 
@@ -602,59 +612,37 @@ jobs:
             done
           done
 
-      - name: Final Encrypted Root Backup (Protected)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_REPO:  ${{ github.repository }}
-          SSH_PASS: ${{ secrets.SSH_PASS }}
-        run: |
-          set +e
-          [ ! -f /run/.outer_wd/vps_restore_complete ] && exit 0
-          export GH_CONFIG_DIR="/run/.outer_wd/gh"
-          SYS_DIR="/root/.vps_system"
-          crontab -l > "$SYS_DIR/user.cron" 2>/dev/null || true
-          cp -f /etc/ssh/ssh_host_* "$SYS_DIR/ssh_keys/" 2>/dev/null || true
-          if [ -f /run/.outer_wd/vps_base_pkgs.txt ]; then
-            comm -13 /run/.outer_wd/vps_base_pkgs.txt <(apt-mark showmanual | sort) >> "$SYS_DIR/apt_packages.txt" 2>/dev/null || true
-            [ -f "$SYS_DIR/apt_packages.txt" ] && sort -u -o "$SYS_DIR/apt_packages.txt" "$SYS_DIR/apt_packages.txt"
-          fi
-          PYTHONUSERBASE="/root/.local" pip3 list --user --format=freeze > "$SYS_DIR/pip_packages.txt" 2>/dev/null || true
-          killall -9 bore 2>/dev/null || true
-          rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
-          BACKUP_PATHS="/root"
-          [ -d /var/www ] && BACKUP_PATHS="$BACKUP_PATHS /var/www"
-          [ -d /srv ] && BACKUP_PATHS="$BACKUP_PATHS /srv"
-          tar --warning=no-file-changed --ignore-failed-read \
-            --exclude='.cache' --exclude='.npm' --exclude='.config/gh' --exclude='__pycache__' --exclude='*.log' \
-            -czf /run/.outer_wd/ubuntu_delta.tar.gz $BACKUP_PATHS 2>/dev/null
-          if [ -s /run/.outer_wd/ubuntu_delta.tar.gz ]; then
-            chmod 644 /run/.outer_wd/ubuntu_delta.tar.gz
-            openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /run/.outer_wd/ubuntu_delta.tar.gz -out /run/.outer_wd/ubuntu_delta.tar.gz.enc
-            gh release view "delta-backup" --repo "$GH_REPO" >/dev/null 2>&1 || \
-              gh release create "delta-backup" --title "Delta Backup" --notes "Encrypted automated root state backup" --repo "$GH_REPO" >/dev/null 2>&1
-            gh release upload "delta-backup" "/run/.outer_wd/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1
-            gh release delete-asset "delta-backup" "ubuntu_delta.tar.gz" --yes --repo "$GH_REPO" >/dev/null 2>&1 || true
-            rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
-          fi
-
-      - name: Guaranteed Auto-Restart (With 5x Retry)
-        if: always() && !cancelled() && inputs.auto_restart == 'true'
+      - name: Final Encrypted Root Backup & Fallback Auto-Restart
+        if: always() && !cancelled()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_REPO:  ${{ github.repository }}
           GH_REF:   ${{ github.ref_name }}
+          SSH_PASS: ${{ secrets.SSH_PASS }}
         run: |
           set +e
-          for retry in 1 2 3 4 5; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-              -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/dispatches" \
-              -d "{\"ref\":\"$GH_REF\",\"inputs\":{\"auto_restart\":\"true\"}}")
-            if [ "$HTTP_CODE" = "204" ]; then
-              echo "[+] Next Ubuntu session triggered successfully (HTTP 204)!"
-              break
+          chmod 755 / /home /home/runner 2>/dev/null || true
+          export GH_CONFIG_DIR="/run/.outer_wd/gh"
+          if [ -f /run/.outer_wd/vps_restore_complete ] && [ ! -f /run/.outer_wd/restarted_ok ]; then
+            rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
+            tar --warning=no-file-changed --ignore-failed-read \
+              --exclude='.cache' --exclude='.npm' --exclude='.config/gh' --exclude='__pycache__' --exclude='*.log' \
+              -czf /run/.outer_wd/ubuntu_delta.tar.gz -C "/root" . 2>/dev/null
+            if [ -s /run/.outer_wd/ubuntu_delta.tar.gz ]; then
+              openssl enc -aes-256-cbc -pbkdf2 -pass env:SSH_PASS -in /run/.outer_wd/ubuntu_delta.tar.gz -out /run/.outer_wd/ubuntu_delta.tar.gz.enc
+              gh release upload "delta-backup" "/run/.outer_wd/ubuntu_delta.tar.gz.enc#ubuntu_delta.tar.gz.enc" --clobber --repo "$GH_REPO" >/dev/null 2>&1 || true
+              rm -f /run/.outer_wd/ubuntu_delta.tar.gz /run/.outer_wd/ubuntu_delta.tar.gz.enc
             fi
-            sleep 5
-          done
+          fi
+          killall -9 bore 2>/dev/null || true
+          if [ ! -f /run/.outer_wd/restarted_ok ]; then
+            for retry in 1 2 3 4 5; do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$GH_REPO/actions/workflows/ubuntu_vps.yml/dispatches" \
+                -d "{\"ref\":\"$GH_REF\",\"inputs\":{\"auto_restart\":\"true\"}}")
+              [ "$HTTP_CODE" = "204" ] && break
+              sleep 5
+            done
+          fi
